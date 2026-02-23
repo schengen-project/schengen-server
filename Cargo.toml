@@ -6,7 +6,7 @@ rust-version = "1.85"
 
 [dependencies]
 schengen = "0.2.0"
-ashpd = "0.12.1"
+ashpd = { version = "0.13.0", features = ["input_capture"] }
 reis = "0.5"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1.42", features = ["full"] }

@@ -4,7 +4,10 @@
 //! requesting mouse and keyboard capture permissions.
 
 use anyhow::{Context, Result};
-use ashpd::desktop::input_capture::{Barrier, InputCapture};
+use ashpd::desktop::input_capture::{
+    Barrier, ConnectToEISOptions, CreateSessionOptions, DisableOptions, EnableOptions,
+    GetZonesOptions, InputCapture, ReleaseOptions, SetPointerBarriersOptions,
+};
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
@@ -104,14 +107,14 @@ impl Session {
 ///
 /// Returns an error if querying zones or setting barriers fails
 async fn setup_barriers(
-    proxy: &InputCapture<'_>,
-    session: &ashpd::desktop::Session<'_, InputCapture<'_>>,
+    proxy: &InputCapture,
+    session: &ashpd::desktop::Session<InputCapture>,
     client_configs: &HashMap<String, ClientConfig>,
 ) -> Result<(HashMap<u32, String>, DesktopBounds)> {
     // Query zones from the InputCapture portal
     info!("Querying zones from InputCapture portal...");
     let zones = proxy
-        .zones(session)
+        .zones(session, GetZonesOptions::default())
         .await
         .context("Failed to request zones")?
         .response()
@@ -214,7 +217,12 @@ async fn setup_barriers(
         zones.zone_set()
     );
     proxy
-        .set_pointer_barriers(session, &barriers, zones.zone_set())
+        .set_pointer_barriers(
+            session,
+            &barriers,
+            zones.zone_set(),
+            SetPointerBarriersOptions::default(),
+        )
         .await
         .context("Failed to set pointer barriers")?
         .response()
@@ -296,7 +304,8 @@ pub async fn connect_input_capture(
 
     tokio::spawn(async move {
         // Create session inside the spawned task
-        let (session, _caps) = match proxy.create_session(None, capabilities).await {
+        let opts = CreateSessionOptions::default().set_capabilities(capabilities);
+        let (session, _caps) = match proxy.create_session(None, opts).await {
             Ok(result) => result,
             Err(e) => {
                 warn!("Failed to create InputCapture session: {}", e);
@@ -307,7 +316,10 @@ pub async fn connect_input_capture(
         debug!("InputCapture session created");
 
         // Connect to the EI (Emulated Input) socket
-        let owned_fd = match proxy.connect_to_eis(&session).await {
+        let owned_fd = match proxy
+            .connect_to_eis(&session, ConnectToEISOptions::default())
+            .await
+        {
             Ok(fd) => fd,
             Err(e) => {
                 warn!("Failed to connect to EIS: {}", e);
@@ -395,7 +407,7 @@ pub async fn connect_input_capture(
 
         // Enable the InputCapture session (after subscribing to signals)
         info!("Enabling InputCapture session...");
-        if let Err(e) = proxy.enable(&session).await {
+        if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
             warn!("Failed to enable InputCapture session: {}", e);
             return;
         }
@@ -479,7 +491,7 @@ pub async fn connect_input_capture(
                             info!("✓ Barriers re-configured after zone change");
 
                             // Re-enable the session after reconfiguring barriers
-                            if let Err(e) = proxy.enable(&session).await {
+                            if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
                                 warn!("Failed to re-enable InputCapture session after zone change: {}", e);
                             } else {
                                 info!("✓ InputCapture session re-enabled");
@@ -494,7 +506,8 @@ pub async fn connect_input_capture(
                 // Handle release requests
                 Some((activation_id, cursor_position)) = release_rx.recv() => {
                     info!("Releasing InputCapture session: activation_id={:?}, cursor={:?}", activation_id, cursor_position);
-                    if let Err(e) = proxy.release(&session, activation_id, cursor_position).await {
+                    let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_position);
+                    if let Err(e) = proxy.release(&session, opts).await {
                         warn!("Failed to release InputCapture session: {}", e);
                     } else {
                         info!("✓ InputCapture session released");
@@ -506,7 +519,7 @@ pub async fn connect_input_capture(
                     match control {
                         PortalControl::Enable if !is_enabled => {
                             info!("Enabling InputCapture session...");
-                            if let Err(e) = proxy.enable(&session).await {
+                            if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
                                 warn!("Failed to enable InputCapture session: {}", e);
                             } else {
                                 is_enabled = true;
@@ -515,7 +528,7 @@ pub async fn connect_input_capture(
                         }
                         PortalControl::Disable if is_enabled => {
                             info!("Disabling InputCapture session...");
-                            if let Err(e) = proxy.disable(&session).await {
+                            if let Err(e) = proxy.disable(&session, DisableOptions::default()).await {
                                 warn!("Failed to disable InputCapture session: {}", e);
                             } else {
                                 is_enabled = false;

@@ -18,8 +18,36 @@ use tokio::sync::RwLock;
 use crate::config::{ClientConfig, Position};
 use crate::ei;
 
+/// A 2D point with floating-point coordinates
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Point {
+    /// Create a new Point
+    pub fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+}
+
+/// A 2D size with floating-point dimensions
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Size {
+    pub width: f64,
+    pub height: f64,
+}
+
+impl Size {
+    /// Create a new Size
+    pub fn new(width: f64, height: f64) -> Self {
+        Self { width, height }
+    }
+}
+
 /// Type alias for release event sender
-type ReleaseSender = tokio::sync::mpsc::UnboundedSender<(Option<u32>, Option<(f64, f64)>)>;
+type ReleaseSender = tokio::sync::mpsc::UnboundedSender<(Option<u32>, Option<Point>)>;
 
 /// Desktop bounds from portal zones
 #[derive(Debug, Clone)]
@@ -37,10 +65,8 @@ pub struct ActivatedEvent {
     pub barrier_id: u32,
     /// Activation ID for releasing the capture
     pub activation_id: u32,
-    /// X position where cursor crossed the barrier
-    pub cursor_x: f64,
-    /// Y position where cursor crossed the barrier
-    pub cursor_y: f64,
+    /// Cursor position where the barrier was crossed
+    pub cursor: Point,
 }
 
 /// Portal control commands
@@ -300,7 +326,8 @@ pub async fn connect_input_capture(
     let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
 
     // Create a channel for release requests
-    let (release_tx, mut release_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (release_tx, mut release_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(Option<u32>, Option<Point>)>();
 
     tokio::spawn(async move {
         // Create session inside the spawned task
@@ -447,25 +474,24 @@ pub async fn connect_input_capture(
                         }
                     };
 
-                    let (cursor_x, cursor_y) = match activated.cursor_position() {
-                        Some((x, y)) => (x as f64, y as f64),
+                    let cursor = match activated.cursor_position() {
+                        Some((x, y)) => Point::new(x as f64, y as f64),
                         None => {
                             warn!("Activated event without cursor position");
-                            (0.0, 0.0)
+                            Point::new(0.0, 0.0)
                         }
                     };
 
                     info!(
                         "Portal activated! Activation ID: {}, Barrier ID: {}, Position: ({:.2}, {:.2})",
-                        activation_id, barrier_id, cursor_x, cursor_y
+                        activation_id, barrier_id, cursor.x, cursor.y
                     );
 
                     // Send the activated event through the channel
                     let event = ActivatedEvent {
                         barrier_id,
                         activation_id,
-                        cursor_x,
-                        cursor_y,
+                        cursor,
                     };
 
                     if activated_tx.send(event).is_err() {
@@ -506,7 +532,8 @@ pub async fn connect_input_capture(
                 // Handle release requests
                 Some((activation_id, cursor_position)) = release_rx.recv() => {
                     info!("Releasing InputCapture session: activation_id={:?}, cursor={:?}", activation_id, cursor_position);
-                    let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_position);
+                    let cursor_tuple = cursor_position.map(|p| (p.x, p.y));
+                    let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_tuple);
                     if let Err(e) = proxy.release(&session, opts).await {
                         warn!("Failed to release InputCapture session: {}", e);
                     } else {

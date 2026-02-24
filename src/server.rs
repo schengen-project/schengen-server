@@ -209,17 +209,7 @@ impl Server<PortalConnected> {
                     width,
                     height,
                 }) => {
-                    info!(
-                        "✓ Client '{}' ({:?}) connected ({}x{})",
-                        name, client_id, width, height
-                    );
-
-                    let connected = server.clients().await;
-                    debug!("  Currently connected: {} client(s)", connected.len());
-                    for client in &connected {
-                        debug!("    - {} (ID: {:?})", client.name(), client.id());
-                    }
-
+                    info!("✓ Client '{name}' ({client_id:?}) connected ({width}x{height})");
                     // Enable portal on first client connection
                     let mut enabled = portal_enabled.write().await;
                     if !*enabled {
@@ -233,12 +223,11 @@ impl Server<PortalConnected> {
                 }
 
                 Ok(schengen::server::ServerEvent::ClientDisconnected { client_id, name }) => {
-                    info!("✗ Client '{}' ({:?}) disconnected", name, client_id);
+                    info!("✗ Client '{name}' ({client_id:?}) disconnected");
                     // Notify barrier task about the disconnection
                     if let Err(e) = disconnect_tx.send(name.clone()) {
                         warn!(
-                            "Failed to notify barrier task about client '{}' disconnection: {}",
-                            name, e
+                            "Failed to notify barrier task about client '{name}' disconnection: {e}",
                         );
                     }
 
@@ -277,10 +266,7 @@ impl Server<PortalConnected> {
                     width,
                     height,
                 }) => {
-                    info!(
-                        "ℹ️  Client {:?} updated dimensions: {}x{}",
-                        client_id, width, height
-                    );
+                    info!("ℹ️ Client {client_id:?} updated dimensions: {width}x{height}",);
                 }
 
                 Err(e) => {

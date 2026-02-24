@@ -46,9 +46,6 @@ impl Size {
     }
 }
 
-/// Type alias for release event sender
-type ReleaseSender = tokio::sync::mpsc::UnboundedSender<(Option<u32>, Option<Point>)>;
-
 /// Desktop bounds from portal zones
 #[derive(Debug, Clone)]
 pub struct DesktopBounds {
@@ -58,34 +55,14 @@ pub struct DesktopBounds {
     pub max_y: i32,
 }
 
-/// Activated event from the InputCapture portal
-#[derive(Debug, Clone)]
-pub struct ActivatedEvent {
-    /// Barrier ID that was triggered
-    pub barrier_id: u32,
-    /// Activation ID for releasing the capture
-    pub activation_id: u32,
-    /// Cursor position where the barrier was crossed
-    pub cursor: Point,
-}
-
-/// Portal control commands
-#[derive(Debug, Clone, Copy)]
-pub enum PortalControl {
-    Enable,
-    Disable,
-}
-
 /// Portal session wrapper holding the InputCapture session
 pub struct Session {
     ei_fd: RawFd,
     _owned_fd: OwnedFd,
-    /// Receiver for activated events from the portal
-    pub activated_rx: tokio::sync::mpsc::UnboundedReceiver<ActivatedEvent>,
-    /// Sender to control enable/disable of the portal
-    pub control_tx: tokio::sync::mpsc::UnboundedSender<PortalControl>,
-    /// Sender for releasing the InputCapture session (activation_id, cursor_position)
-    pub release_tx: ReleaseSender,
+    /// Receiver for events from the portal
+    pub event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    /// Sender to send events to the portal
+    pub event_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
 }
 
 impl Session {
@@ -96,21 +73,15 @@ impl Session {
 
     /// Split the session into its components
     ///
-    /// Returns (OwnedFd, activated receiver, control sender, release sender)
+    /// Returns (OwnedFd, event receiver, event sender)
     pub fn split(
         self,
     ) -> (
         OwnedFd,
-        tokio::sync::mpsc::UnboundedReceiver<ActivatedEvent>,
-        tokio::sync::mpsc::UnboundedSender<PortalControl>,
-        ReleaseSender,
+        tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+        tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
     ) {
-        (
-            self._owned_fd,
-            self.activated_rx,
-            self.control_tx,
-            self.release_tx,
-        )
+        (self._owned_fd, self.event_rx, self.event_tx)
     }
 }
 
@@ -319,15 +290,11 @@ pub async fn connect_input_capture(
     // Create a oneshot channel to get the fd back from the spawned task
     let (fd_tx, fd_rx) = tokio::sync::oneshot::channel();
 
-    // Create a channel for activated events
-    let (activated_tx, activated_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Create a channel for portal control commands (enable/disable)
-    let (control_tx, mut control_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    // Create a channel for release requests
-    let (release_tx, mut release_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(Option<u32>, Option<Point>)>();
+    // Create event channels for bidirectional communication
+    // portal_to_server: portal task sends events to server
+    // server_to_portal: server sends events to portal task
+    let (portal_to_server_tx, portal_to_server_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (server_to_portal_tx, mut server_to_portal_rx) = tokio::sync::mpsc::unbounded_channel();
 
     tokio::spawn(async move {
         // Create session inside the spawned task
@@ -391,12 +358,12 @@ pub async fn connect_input_capture(
         info!("Waiting for first client connection before enabling InputCapture...");
         let mut is_enabled = false;
         loop {
-            match control_rx.recv().await {
-                Some(PortalControl::Enable) if !is_enabled => {
+            match server_to_portal_rx.recv().await {
+                Some(crate::server::Event::EnableCapture) if !is_enabled => {
                     info!("Received enable command");
                     break;
                 }
-                Some(PortalControl::Disable) if is_enabled => {
+                Some(crate::server::Event::DisableCapture) if is_enabled => {
                     // Will handle in main loop below
                     warn!("Received disable before initial enable, ignoring");
                 }
@@ -404,7 +371,7 @@ pub async fn connect_input_capture(
                     // Ignore redundant commands
                 }
                 None => {
-                    warn!("Control channel closed, not enabling InputCapture");
+                    warn!("Event channel closed, not enabling InputCapture");
                     return;
                 }
             }
@@ -487,14 +454,26 @@ pub async fn connect_input_capture(
                         activation_id, barrier_id, cursor.x, cursor.y
                     );
 
+                    // Look up client info from barrier map
+                    let barrier_lookup = barrier_map_clone.read().await;
+                    let (client_name, client_position) = match barrier_lookup.get(&barrier_id) {
+                        Some((name, position)) => (name.clone(), *position),
+                        None => {
+                            warn!("Unknown barrier ID: {} (no client mapping found)", barrier_id);
+                            continue;
+                        }
+                    };
+                    drop(barrier_lookup);
+
                     // Send the activated event through the channel
-                    let event = ActivatedEvent {
-                        barrier_id,
+                    let event = crate::server::Event::Activated {
+                        client_name,
+                        client_position,
                         activation_id,
                         cursor,
                     };
 
-                    if activated_tx.send(event).is_err() {
+                    if portal_to_server_tx.send(event).is_err() {
                         warn!("Failed to send activated event (receiver dropped)");
                         break;
                     }
@@ -529,22 +508,20 @@ pub async fn connect_input_capture(
                     }
                 }
 
-                // Handle release requests
-                Some((activation_id, cursor_position)) = release_rx.recv() => {
-                    info!("Releasing InputCapture session: activation_id={:?}, cursor={:?}", activation_id, cursor_position);
-                    let cursor_tuple = cursor_position.map(|p| (p.x, p.y));
-                    let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_tuple);
-                    if let Err(e) = proxy.release(&session, opts).await {
-                        warn!("Failed to release InputCapture session: {}", e);
-                    } else {
-                        info!("✓ InputCapture session released");
-                    }
-                }
-
-                // Handle enable/disable control commands
-                Some(control) = control_rx.recv() => {
-                    match control {
-                        PortalControl::Enable if !is_enabled => {
+                // Handle events from server
+                Some(event) = server_to_portal_rx.recv() => {
+                    match event {
+                        crate::server::Event::ReleaseCapture { activation_id, cursor } => {
+                            info!("Releasing InputCapture session: activation_id={:?}, cursor={:?}", activation_id, cursor);
+                            let cursor_tuple = cursor.map(|p| (p.x, p.y));
+                            let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_tuple);
+                            if let Err(e) = proxy.release(&session, opts).await {
+                                warn!("Failed to release InputCapture session: {}", e);
+                            } else {
+                                info!("✓ InputCapture session released");
+                            }
+                        }
+                        crate::server::Event::EnableCapture if !is_enabled => {
                             info!("Enabling InputCapture session...");
                             if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
                                 warn!("Failed to enable InputCapture session: {}", e);
@@ -553,7 +530,7 @@ pub async fn connect_input_capture(
                                 info!("✓ InputCapture session enabled");
                             }
                         }
-                        PortalControl::Disable if is_enabled => {
+                        crate::server::Event::DisableCapture if is_enabled => {
                             info!("Disabling InputCapture session...");
                             if let Err(e) = proxy.disable(&session, DisableOptions::default()).await {
                                 warn!("Failed to disable InputCapture session: {}", e);
@@ -562,9 +539,12 @@ pub async fn connect_input_capture(
                                 info!("✓ InputCapture session disabled");
                             }
                         }
-                        _ => {
+                        crate::server::Event::EnableCapture | crate::server::Event::DisableCapture => {
                             // Ignore redundant enable/disable commands
-                            debug!("Ignoring redundant {:?} command (is_enabled={})", control, is_enabled);
+                            debug!("Ignoring redundant {:?} command (is_enabled={})", event, is_enabled);
+                        }
+                        _ => {
+                            warn!("Portal received unexpected event: {:?}", event);
                         }
                     }
                 }
@@ -592,9 +572,8 @@ pub async fn connect_input_capture(
     let portal_session = Session {
         ei_fd: raw_fd,
         _owned_fd: owned_fd,
-        activated_rx,
-        control_tx,
-        release_tx,
+        event_rx: portal_to_server_rx,
+        event_tx: server_to_portal_tx,
     };
 
     // Now connect to EI and get the context with devices

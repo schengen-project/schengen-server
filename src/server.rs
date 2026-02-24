@@ -26,7 +26,7 @@ pub struct NotConnected;
 pub struct PortalConnected {
     portal_session: portal::Session,
     ei_context: ei::EiContext,
-    barrier_map: Arc<RwLock<HashMap<u32, String>>>,
+    barrier_map: Arc<RwLock<HashMap<u32, (String, crate::config::Position)>>>,
     desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
 }
 
@@ -323,7 +323,7 @@ async fn handle_barrier_events(
     server: Arc<schengen::server::Server>,
     mut activated_rx: tokio::sync::mpsc::UnboundedReceiver<portal::ActivatedEvent>,
     mut ei_context: ei::EiContext,
-    barrier_map: Arc<RwLock<HashMap<u32, String>>>,
+    barrier_map: Arc<RwLock<HashMap<u32, (String, crate::config::Position)>>>,
     desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
     release_tx: ReleaseSender,
     mut disconnect_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
@@ -337,13 +337,13 @@ async fn handle_barrier_events(
     let mut current_activation_id: Option<u32> = None;
 
     // Track the current cursor position (in absolute desktop coordinates)
-    let mut cursor_x: f64 = 3072.0; // Center of typical multi-monitor desktop
-    let mut cursor_y: f64 = 864.0;
+    let mut cursor_x: f64 = 1920.0 / 2.0;
+    let mut cursor_y: f64 = 1080.0 / 2.0;
 
-    info!(
-        "Tracking cursor position starting at ({:.2}, {:.2})",
-        cursor_x, cursor_y
-    );
+    // Track the offset between desktop and client coordinates
+    // client_coord = desktop_coord - offset
+    let mut coord_offset_x: f64 = 0.0;
+    let mut coord_offset_y: f64 = 0.0;
 
     loop {
         tokio::select! {
@@ -356,8 +356,8 @@ async fn handle_barrier_events(
 
                 // Look up which client this barrier corresponds to
                 let barrier_lookup = barrier_map.read().await;
-                let client_name = match barrier_lookup.get(&activated_event.barrier_id) {
-                    Some(name) => name.clone(),
+                let (client_name, client_position) = match barrier_lookup.get(&activated_event.barrier_id) {
+                    Some((name, position)) => (name.clone(), *position),
                     None => {
                         warn!(
                             "Unknown barrier ID: {} (no client mapping found)",
@@ -384,11 +384,43 @@ async fn handle_barrier_events(
                 let client_width = client.width;
                 let client_height = client.height;
 
-                // Send cursor entered message to the client
-                // For now, send cursor position as center of client screen
-                // TODO: Map desktop coordinates to client coordinates based on barrier position
-                let enter_x = (client_width / 2) as i16;
-                let enter_y = (client_height / 2) as i16;
+                // Map desktop barrier coordinates to client entry coordinates
+                // based on the client's position relative to the server
+                let bounds = desktop_bounds.read().await;
+                let desktop_width = (bounds.max_x - bounds.min_x) as f64;
+                let desktop_height = (bounds.max_y - bounds.min_y) as f64;
+                drop(bounds);
+
+                let (enter_x, enter_y) = match client_position {
+                    crate::config::Position::RightOf => {
+                        // Client is to the right: enter at left edge (x=0)
+                        // Map y coordinate from desktop to client coordinate space
+                        let y_ratio = activated_event.cursor_y / desktop_height;
+                        let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
+                        (0, client_y)
+                    }
+                    crate::config::Position::LeftOf => {
+                        // Client is to the left: enter at right edge (x=client_width-1)
+                        // Map y coordinate from desktop to client coordinate space
+                        let y_ratio = activated_event.cursor_y / desktop_height;
+                        let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
+                        ((client_width - 1) as i16, client_y)
+                    }
+                    crate::config::Position::TopOf => {
+                        // Client is above: enter at bottom edge (y=client_height-1)
+                        // Map x coordinate from desktop to client coordinate space
+                        let x_ratio = activated_event.cursor_x / desktop_width;
+                        let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
+                        (client_x, (client_height - 1) as i16)
+                    }
+                    crate::config::Position::BottomOf => {
+                        // Client is below: enter at top edge (y=0)
+                        // Map x coordinate from desktop to client coordinate space
+                        let x_ratio = activated_event.cursor_x / desktop_width;
+                        let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
+                        (client_x, 0)
+                    }
+                };
 
                 info!("Switching input focus to client '{}' ({}x{}), entering at ({}, {})",
                     client_name, client_width, client_height, enter_x, enter_y);
@@ -407,13 +439,14 @@ async fn handle_barrier_events(
                 active_client_id = Some(client_id);
                 current_activation_id = Some(activated_event.activation_id);
 
-                // Update cursor position to the activation point
+                // Update cursor position to the activation point (in desktop coordinates)
                 cursor_x = activated_event.cursor_x;
                 cursor_y = activated_event.cursor_y;
 
-                // Store client dimensions for coordinate mapping
-                // Store as Option<(width, height)> keyed by client_id
-                // For now, we'll read this from connected_clients when needed
+                // Calculate offset between desktop and client coordinates
+                // This allows us to map subsequent desktop coordinates to client coordinates
+                coord_offset_x = activated_event.cursor_x - enter_x as f64;
+                coord_offset_y = activated_event.cursor_y - enter_y as f64;
 
                 info!("Client '{}' is now active and receiving input (activation_id={}, cursor=({:.2}, {:.2}))",
                     client_name, activated_event.activation_id, cursor_x, cursor_y);
@@ -541,8 +574,9 @@ async fn handle_barrier_events(
                 if needs_mouse_update && !client_disconnected
                     && let Some((final_x, final_y)) = last_mouse_pos
                 {
-                    let client_x = (final_x.rem_euclid(client_width)) as i16;
-                    let client_y = (final_y.rem_euclid(client_height)) as i16;
+                    // Map desktop coordinates to client coordinates using the offset
+                    let client_x = ((final_x - coord_offset_x).clamp(0.0, client_width - 1.0)) as i16;
+                    let client_y = ((final_y - coord_offset_y).clamp(0.0, client_height - 1.0)) as i16;
                     debug!("Sending coalesced mouse move to client: ({}, {}) [from desktop ({:.2}, {:.2})]",
                         client_x, client_y, final_x, final_y);
                     if let Err(e) = server.send_mouse_move(client_id, client_x, client_y).await {
@@ -568,6 +602,8 @@ async fn handle_barrier_events(
                     current_activation_id = None;
                     cursor_x = 0.0;
                     cursor_y = 0.0;
+                    coord_offset_x = 0.0;
+                    coord_offset_y = 0.0;
                 } else if pointer_back_on_server {
                     // Send cursor left message to client
                     if let Err(e) = server.send_cursor_left(client_id).await {
@@ -591,6 +627,8 @@ async fn handle_barrier_events(
                     current_activation_id = None;
                     cursor_x = 0.0;
                     cursor_y = 0.0;
+                    coord_offset_x = 0.0;
+                    coord_offset_y = 0.0;
                     info!("Input focus returned to server");
                 }
             }

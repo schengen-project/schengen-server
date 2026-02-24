@@ -345,6 +345,11 @@ async fn handle_barrier_events(
     let mut coord_offset_x: f64 = 0.0;
     let mut coord_offset_y: f64 = 0.0;
 
+    // Track the active client's position and dimensions for cursor clamping
+    let mut active_client_position: Option<crate::config::Position> = None;
+    let mut active_client_width: f64 = 0.0;
+    let mut active_client_height: f64 = 0.0;
+
     loop {
         tokio::select! {
             // Handle barrier activation events
@@ -448,6 +453,11 @@ async fn handle_barrier_events(
                 coord_offset_x = activated_event.cursor_x - enter_x as f64;
                 coord_offset_y = activated_event.cursor_y - enter_y as f64;
 
+                // Store client position and dimensions for cursor clamping
+                active_client_position = Some(client_position);
+                active_client_width = client_width as f64;
+                active_client_height = client_height as f64;
+
                 info!("Client '{}' is now active and receiving input (activation_id={}, cursor=({:.2}, {:.2}))",
                     client_name, activated_event.activation_id, cursor_x, cursor_y);
             }
@@ -496,6 +506,37 @@ async fn handle_barrier_events(
                             cursor_y = y;
                             debug!("ei: PointerAbsolute event: ({:.2}, {:.2})", x, y);
 
+                            // Clamp cursor to client bounds based on client position
+                            if let Some(position) = active_client_position {
+                                let client_min_x = coord_offset_x;
+                                let client_max_x = coord_offset_x + active_client_width - 1.0;
+                                let client_min_y = coord_offset_y;
+                                let client_max_y = coord_offset_y + active_client_height - 1.0;
+
+                                match position {
+                                    crate::config::Position::RightOf => {
+                                        // Entered from left - allow exit left, clamp right/top/bottom
+                                        cursor_x = cursor_x.min(client_max_x);
+                                        cursor_y = cursor_y.clamp(client_min_y, client_max_y);
+                                    }
+                                    crate::config::Position::LeftOf => {
+                                        // Entered from right - allow exit right, clamp left/top/bottom
+                                        cursor_x = cursor_x.max(client_min_x);
+                                        cursor_y = cursor_y.clamp(client_min_y, client_max_y);
+                                    }
+                                    crate::config::Position::TopOf => {
+                                        // Entered from bottom - allow exit bottom, clamp left/right/top
+                                        cursor_x = cursor_x.clamp(client_min_x, client_max_x);
+                                        cursor_y = cursor_y.max(client_min_y);
+                                    }
+                                    crate::config::Position::BottomOf => {
+                                        // Entered from top - allow exit top, clamp left/right/bottom
+                                        cursor_x = cursor_x.clamp(client_min_x, client_max_x);
+                                        cursor_y = cursor_y.min(client_max_y);
+                                    }
+                                }
+                            }
+
                             // Check if pointer is within desktop bounds
                             if cursor_x >= bounds.min_x as f64 && cursor_x < bounds.max_x as f64 &&
                                cursor_y >= bounds.min_y as f64 && cursor_y < bounds.max_y as f64 {
@@ -513,6 +554,37 @@ async fn handle_barrier_events(
                             cursor_x += dx;
                             cursor_y += dy;
                             debug!("ei: PointerRelative event: delta=({:.2}, {:.2}), cursor=({:.2}, {:.2})", dx, dy, cursor_x, cursor_y);
+
+                            // Clamp cursor to client bounds based on client position
+                            if let Some(position) = active_client_position {
+                                let client_min_x = coord_offset_x;
+                                let client_max_x = coord_offset_x + active_client_width - 1.0;
+                                let client_min_y = coord_offset_y;
+                                let client_max_y = coord_offset_y + active_client_height - 1.0;
+
+                                match position {
+                                    crate::config::Position::RightOf => {
+                                        // Entered from left - allow exit left, clamp right/top/bottom
+                                        cursor_x = cursor_x.min(client_max_x);
+                                        cursor_y = cursor_y.clamp(client_min_y, client_max_y);
+                                    }
+                                    crate::config::Position::LeftOf => {
+                                        // Entered from right - allow exit right, clamp left/top/bottom
+                                        cursor_x = cursor_x.max(client_min_x);
+                                        cursor_y = cursor_y.clamp(client_min_y, client_max_y);
+                                    }
+                                    crate::config::Position::TopOf => {
+                                        // Entered from bottom - allow exit bottom, clamp left/right/top
+                                        cursor_x = cursor_x.clamp(client_min_x, client_max_x);
+                                        cursor_y = cursor_y.max(client_min_y);
+                                    }
+                                    crate::config::Position::BottomOf => {
+                                        // Entered from top - allow exit top, clamp left/right/bottom
+                                        cursor_x = cursor_x.clamp(client_min_x, client_max_x);
+                                        cursor_y = cursor_y.min(client_max_y);
+                                    }
+                                }
+                            }
 
                             // Check if pointer is within desktop bounds
                             if cursor_x >= bounds.min_x as f64 && cursor_x < bounds.max_x as f64 &&
@@ -604,6 +676,9 @@ async fn handle_barrier_events(
                     cursor_y = 0.0;
                     coord_offset_x = 0.0;
                     coord_offset_y = 0.0;
+                    active_client_position = None;
+                    active_client_width = 0.0;
+                    active_client_height = 0.0;
                 } else if pointer_back_on_server {
                     // Send cursor left message to client
                     if let Err(e) = server.send_cursor_left(client_id).await {
@@ -629,6 +704,9 @@ async fn handle_barrier_events(
                     cursor_y = 0.0;
                     coord_offset_x = 0.0;
                     coord_offset_y = 0.0;
+                    active_client_position = None;
+                    active_client_width = 0.0;
+                    active_client_height = 0.0;
                     info!("Input focus returned to server");
                 }
             }

@@ -16,8 +16,37 @@ use crate::portal;
 
 const DEFAULT_PORT: u16 = 24801;
 
-/// Type alias for release event sender
-type ReleaseSender = tokio::sync::mpsc::UnboundedSender<(Option<u32>, Option<portal::Point>)>;
+/// Events that flow between the portal and server
+#[derive(Debug, Clone)]
+pub enum Event {
+    /// Barrier was activated - cursor crossed into client area
+    Activated {
+        /// Which client's barrier was crossed
+        client_name: String,
+        /// Client's position relative to server
+        client_position: crate::config::Position,
+        /// Activation ID for releasing the capture
+        activation_id: u32,
+        /// Cursor position where the barrier was crossed
+        cursor: portal::Point,
+    },
+    /// A Synergy client disconnected
+    ClientDisconnected {
+        /// Name of the disconnected client
+        client_name: String,
+    },
+    /// Request to enable the InputCapture portal
+    EnableCapture,
+    /// Request to disable the InputCapture portal
+    DisableCapture,
+    /// Request to release the current capture session
+    ReleaseCapture {
+        /// Activation ID to release
+        activation_id: Option<u32>,
+        /// Optional cursor position for release
+        cursor: Option<portal::Point>,
+    },
+}
 
 /// Information about an active client receiving input
 struct ActiveClient {
@@ -41,7 +70,6 @@ pub struct NotConnected;
 pub struct PortalConnected {
     portal_session: portal::Session,
     ei_context: ei::EiContext,
-    barrier_map: Arc<RwLock<HashMap<u32, (String, crate::config::Position)>>>,
     desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
 }
 
@@ -84,7 +112,7 @@ impl Server<NotConnected> {
     /// Returns an error if portal connection or barrier setup fails
     pub async fn connect_portal(self) -> Result<Server<PortalConnected>> {
         info!("Connecting to InputCapture portal and libei...");
-        let (portal_session, ei_context, barrier_map, desktop_bounds) =
+        let (portal_session, ei_context, _barrier_map, desktop_bounds) =
             portal::connect_input_capture(&self.client_configs).await?;
 
         Ok(Server {
@@ -93,7 +121,6 @@ impl Server<NotConnected> {
             state: PortalConnected {
                 portal_session,
                 ei_context,
-                barrier_map,
                 desktop_bounds,
             },
         })
@@ -112,7 +139,6 @@ impl Server<PortalConnected> {
     pub async fn run(self) -> Result<()> {
         let portal_session = self.state.portal_session;
         let ei_context = self.state.ei_context;
-        let barrier_map = self.state.barrier_map;
         let desktop_bounds = self.state.desktop_bounds;
 
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", self.port)
@@ -188,16 +214,11 @@ impl Server<PortalConnected> {
         let server = Arc::new(server);
 
         // Split portal session to extract components
-        let (_owned_fd, activated_rx, control_tx, release_tx) = portal_session.split();
-
-        // Track whether portal has been enabled
-        let portal_enabled = Arc::new(tokio::sync::RwLock::new(false));
-
-        // Create a channel to notify barrier task about client disconnections
-        let (disconnect_tx, disconnect_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (_owned_fd, mut event_rx, event_tx) = portal_session.split();
 
         // Clone server for the barrier event handler
         let barrier_server = Arc::clone(&server);
+        let event_tx_clone = event_tx.clone();
 
         // Spawn a task to handle barrier events
         let barrier_task = tokio::spawn(async move {
@@ -205,17 +226,16 @@ impl Server<PortalConnected> {
             let _keep_alive = _owned_fd;
             handle_barrier_events(
                 barrier_server,
-                activated_rx,
+                &mut event_rx,
+                event_tx_clone,
                 ei_context,
-                barrier_map,
                 desktop_bounds,
-                release_tx,
-                disconnect_rx,
             )
             .await
         });
 
         // Main event loop - handle server events
+        let mut portal_enabled = false;
         loop {
             match server.recv_event().await {
                 Ok(schengen::server::ServerEvent::ClientConnected {
@@ -226,13 +246,12 @@ impl Server<PortalConnected> {
                 }) => {
                     info!("✓ Client '{name}' ({client_id:?}) connected ({width}x{height})");
                     // Enable portal on first client connection
-                    let mut enabled = portal_enabled.write().await;
-                    if !*enabled {
-                        if let Err(e) = control_tx.send(portal::PortalControl::Enable) {
+                    if !portal_enabled {
+                        if let Err(e) = event_tx.send(Event::EnableCapture) {
                             warn!("Failed to send enable command to portal: {}", e);
                         } else {
                             debug!("First client connected, enabling InputCapture portal");
-                            *enabled = true;
+                            portal_enabled = true;
                         }
                     }
                 }
@@ -240,7 +259,9 @@ impl Server<PortalConnected> {
                 Ok(schengen::server::ServerEvent::ClientDisconnected { client_id, name }) => {
                     info!("✗ Client '{name}' ({client_id:?}) disconnected");
                     // Notify barrier task about the disconnection
-                    if let Err(e) = disconnect_tx.send(name.clone()) {
+                    if let Err(e) = event_tx.send(Event::ClientDisconnected {
+                        client_name: name.clone(),
+                    }) {
                         warn!(
                             "Failed to notify barrier task about client '{name}' disconnection: {e}",
                         );
@@ -248,15 +269,12 @@ impl Server<PortalConnected> {
 
                     // Disable portal if this was the last client
                     let connected = server.clients().await;
-                    if connected.is_empty() {
-                        let mut enabled = portal_enabled.write().await;
-                        if *enabled {
-                            if let Err(e) = control_tx.send(portal::PortalControl::Disable) {
-                                warn!("Failed to send disable command to portal: {}", e);
-                            } else {
-                                info!("Last client disconnected, disabling InputCapture portal");
-                                *enabled = false;
-                            }
+                    if connected.is_empty() && portal_enabled {
+                        if let Err(e) = event_tx.send(Event::DisableCapture) {
+                            warn!("Failed to send disable command to portal: {}", e);
+                        } else {
+                            info!("Last client disconnected, disabling InputCapture portal");
+                            portal_enabled = false;
                         }
                     }
                 }
@@ -298,33 +316,28 @@ impl Server<PortalConnected> {
     }
 }
 
-/// Handle barrier events and forward input to clients
+/// Handle portal events and forward input to clients
 ///
-/// This function monitors the portal for activated events (when the pointer
-/// crosses a barrier at a screen edge) and forwards the appropriate input
-/// events to clients using the schengen server API.
+/// This function monitors events from the portal (barrier activations, client disconnects)
+/// and forwards the appropriate input events to clients using the schengen server API.
 ///
 /// # Arguments
 ///
 /// * `server` - The schengen server for sending messages to clients
-/// * `activated_rx` - Receiver for activated events from the InputCapture portal
+/// * `event_rx` - Receiver for events from the portal
+/// * `event_tx` - Sender for events to the portal
 /// * `ei_context` - The EI context for receiving input events
-/// * `barrier_map` - Map of barrier IDs to client names
 /// * `desktop_bounds` - Desktop bounds for checking if pointer is back on server
-/// * `release_tx` - Sender to release the InputCapture session
-/// * `disconnect_rx` - Receiver for client disconnection notifications
 ///
 /// # Errors
 ///
 /// Returns an error if receiving events fails
 async fn handle_barrier_events(
     server: Arc<schengen::server::Server>,
-    mut activated_rx: tokio::sync::mpsc::UnboundedReceiver<portal::ActivatedEvent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
     mut ei_context: ei::EiContext,
-    barrier_map: Arc<RwLock<HashMap<u32, (String, crate::config::Position)>>>,
     desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
-    release_tx: ReleaseSender,
-    mut disconnect_rx: tokio::sync::mpsc::UnboundedReceiver<String>,
 ) -> Result<()> {
     info!("Starting barrier event handler");
 
@@ -339,112 +352,137 @@ async fn handle_barrier_events(
 
     loop {
         tokio::select! {
-            // Handle barrier activation events
-            Some(activated_event) = activated_rx.recv() => {
-                info!(
-                    "Barrier activated: id={}, cursor=({:.2}, {:.2})",
-                    activated_event.barrier_id, activated_event.cursor.x, activated_event.cursor.y
-                );
-
-                // Look up which client this barrier corresponds to
-                let barrier_lookup = barrier_map.read().await;
-                let (client_name, client_position) = match barrier_lookup.get(&activated_event.barrier_id) {
-                    Some((name, position)) => (name.clone(), *position),
-                    None => {
-                        warn!(
-                            "Unknown barrier ID: {} (no client mapping found)",
-                            activated_event.barrier_id
+            // Handle portal events
+            Some(event) = event_rx.recv() => {
+                match event {
+                    Event::Activated {
+                        client_name,
+                        client_position,
+                        activation_id,
+                        cursor: event_cursor,
+                    } => {
+                        info!(
+                            "Barrier activated for client '{}' at cursor=({:.2}, {:.2})",
+                            client_name, event_cursor.x, event_cursor.y
                         );
-                        continue;
-                    }
-                };
-                drop(barrier_lookup);
 
-                info!("Barrier {} corresponds to client '{}'", activated_event.barrier_id, client_name);
+                        // Find the client ID from the connected clients list
+                        let connected = server.clients().await;
+                        let client_info = match connected.iter().find(|c| c.name() == client_name) {
+                            Some(c) => c,
+                            None => {
+                                warn!("Client '{}' not connected, ignoring barrier activation", client_name);
+                                continue;
+                            }
+                        };
 
-                // Find the client ID from the connected clients list
-                let connected = server.clients().await;
-                let client = match connected.iter().find(|c| c.name() == client_name) {
-                    Some(c) => c,
-                    None => {
-                        warn!("Client '{}' not connected, ignoring barrier activation", client_name);
-                        continue;
-                    }
-                };
+                        let client_id = client_info.id();
+                        let client_width = client_info.width;
+                        let client_height = client_info.height;
 
-                let client_id = client.id();
-                let client_width = client.width;
-                let client_height = client.height;
+                        // Map desktop barrier coordinates to client entry coordinates
+                        // based on the client's position relative to the server
+                        let bounds = desktop_bounds.read().await;
+                        let desktop_width = (bounds.max_x - bounds.min_x) as f64;
+                        let desktop_height = (bounds.max_y - bounds.min_y) as f64;
+                        drop(bounds);
 
-                // Map desktop barrier coordinates to client entry coordinates
-                // based on the client's position relative to the server
-                let bounds = desktop_bounds.read().await;
-                let desktop_width = (bounds.max_x - bounds.min_x) as f64;
-                let desktop_height = (bounds.max_y - bounds.min_y) as f64;
-                drop(bounds);
+                        let (enter_x, enter_y) = match client_position {
+                            crate::config::Position::RightOf => {
+                                // Client is to the right: enter at left edge (x=0)
+                                // Map y coordinate from desktop to client coordinate space
+                                let y_ratio = event_cursor.y / desktop_height;
+                                let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
+                                (0, client_y)
+                            }
+                            crate::config::Position::LeftOf => {
+                                // Client is to the left: enter at right edge (x=client_width-1)
+                                // Map y coordinate from desktop to client coordinate space
+                                let y_ratio = event_cursor.y / desktop_height;
+                                let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
+                                ((client_width - 1) as i16, client_y)
+                            }
+                            crate::config::Position::TopOf => {
+                                // Client is above: enter at bottom edge (y=client_height-1)
+                                // Map x coordinate from desktop to client coordinate space
+                                let x_ratio = event_cursor.x / desktop_width;
+                                let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
+                                (client_x, (client_height - 1) as i16)
+                            }
+                            crate::config::Position::BottomOf => {
+                                // Client is below: enter at top edge (y=0)
+                                // Map x coordinate from desktop to client coordinate space
+                                let x_ratio = event_cursor.x / desktop_width;
+                                let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
+                                (client_x, 0)
+                            }
+                        };
 
-                let (enter_x, enter_y) = match client_position {
-                    crate::config::Position::RightOf => {
-                        // Client is to the right: enter at left edge (x=0)
-                        // Map y coordinate from desktop to client coordinate space
-                        let y_ratio = activated_event.cursor.y / desktop_height;
-                        let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
-                        (0, client_y)
-                    }
-                    crate::config::Position::LeftOf => {
-                        // Client is to the left: enter at right edge (x=client_width-1)
-                        // Map y coordinate from desktop to client coordinate space
-                        let y_ratio = activated_event.cursor.y / desktop_height;
-                        let client_y = (y_ratio * client_height as f64).clamp(0.0, client_height as f64 - 1.0) as i16;
-                        ((client_width - 1) as i16, client_y)
-                    }
-                    crate::config::Position::TopOf => {
-                        // Client is above: enter at bottom edge (y=client_height-1)
-                        // Map x coordinate from desktop to client coordinate space
-                        let x_ratio = activated_event.cursor.x / desktop_width;
-                        let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
-                        (client_x, (client_height - 1) as i16)
-                    }
-                    crate::config::Position::BottomOf => {
-                        // Client is below: enter at top edge (y=0)
-                        // Map x coordinate from desktop to client coordinate space
-                        let x_ratio = activated_event.cursor.x / desktop_width;
-                        let client_x = (x_ratio * client_width as f64).clamp(0.0, client_width as f64 - 1.0) as i16;
-                        (client_x, 0)
-                    }
-                };
+                        info!("Switching input focus to client '{}' ({}x{}), entering at ({}, {})",
+                            client_name, client_width, client_height, enter_x, enter_y);
+                        if let Err(e) = server.send_cursor_entered(
+                            client_id,
+                            enter_x,
+                            enter_y,
+                            0,  // sequence number
+                            0,  // mask
+                        ).await {
+                            warn!("Failed to send cursor entered to '{}': {}", client_name, e);
+                            continue;
+                        }
 
-                info!("Switching input focus to client '{}' ({}x{}), entering at ({}, {})",
-                    client_name, client_width, client_height, enter_x, enter_y);
-                if let Err(e) = server.send_cursor_entered(
-                    client_id,
-                    enter_x,
-                    enter_y,
-                    0,  // sequence number
-                    0,  // mask
-                ).await {
-                    warn!("Failed to send cursor entered to '{}': {}", client_name, e);
-                    continue;
+                        // Set this client as the active one and store activation ID
+                        active_client = Some(ActiveClient {
+                            id: client_id,
+                            name: client_name.clone(),
+                            position: client_position,
+                            size: portal::Size::new(client_width as f64, client_height as f64),
+                            coord_offset: portal::Point::new(
+                                event_cursor.x - enter_x as f64,
+                                event_cursor.y - enter_y as f64,
+                            ),
+                        });
+                        current_activation_id = Some(activation_id);
+
+                        // Update cursor position to the activation point (in desktop coordinates)
+                        cursor = event_cursor;
+
+                        info!("Client '{}' is now active and receiving input (activation_id={}, cursor=({:.2}, {:.2}))",
+                            client_name, activation_id, cursor.x, cursor.y);
+                    }
+
+                    Event::ClientDisconnected { client_name } => {
+                        debug!("Received disconnect notification for client '{}'", client_name);
+
+                        // Check if this client is currently active (has input focus)
+                        if let Some(ref client) = active_client {
+                            // If the disconnected client was the active one, release InputCapture
+                            if client.name == client_name {
+                                warn!("Active client '{}' disconnected, releasing InputCapture", client_name);
+
+                                // Release the InputCapture session
+                                if let Some(activation_id) = current_activation_id {
+                                    info!("Releasing InputCapture due to active client disconnect (activation_id={})", activation_id);
+                                    if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                                        activation_id: Some(activation_id),
+                                        cursor: None,
+                                    }) {
+                                        warn!("Failed to send release request: {:?}", e);
+                                    }
+                                }
+
+                                // Clear active client and activation ID
+                                active_client = None;
+                                current_activation_id = None;
+                                cursor = portal::Point::new(0.0, 0.0);
+                            }
+                        }
+                    }
+
+                    _ => {
+                        warn!("Unexpected event in barrier handler: {:?}", event);
+                    }
                 }
-
-                // Set this client as the active one and store activation ID
-                active_client = Some(ActiveClient {
-                    id: client_id,
-                    name: client_name.clone(),
-                    position: client_position,
-                    size: portal::Size::new(client_width as f64, client_height as f64),
-                    coord_offset: portal::Point::new(
-                        activated_event.cursor.x - enter_x as f64,
-                        activated_event.cursor.y - enter_y as f64,
-                    ),
-                });
-                current_activation_id = Some(activated_event.activation_id);
-
-                // Update cursor position to the activation point (in desktop coordinates)
-                cursor = activated_event.cursor;
-
-                info!("Client '{}' is now active and receiving input (activation_id={}, cursor=({:.2}, {:.2}))",
-                    client_name, activated_event.activation_id, cursor.x, cursor.y);
             }
 
             // Process EI events and forward to active client
@@ -634,7 +672,10 @@ async fn handle_barrier_events(
                     // Release the InputCapture session
                     if let Some(activation_id) = current_activation_id {
                         info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                        if let Err(e) = release_tx.send((Some(activation_id), None)) {
+                        if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                            activation_id: Some(activation_id),
+                            cursor: None,
+                        }) {
                             warn!("Failed to send release request: {:?}", e);
                         }
                     }
@@ -654,7 +695,10 @@ async fn handle_barrier_events(
                         let cursor_str = release_cursor_pos.map(|p| format!("({:.2}, {:.2})", p.x, p.y))
                             .unwrap_or_else(|| "None".to_string());
                         info!("Releasing InputCapture (activation_id={}, cursor={})", activation_id, cursor_str);
-                        if let Err(e) = release_tx.send((Some(activation_id), release_cursor_pos)) {
+                        if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                            activation_id: Some(activation_id),
+                            cursor: release_cursor_pos,
+                        }) {
                             warn!("Failed to send release request: {:?}", e);
                         }
                     } else {
@@ -666,32 +710,6 @@ async fn handle_barrier_events(
                     current_activation_id = None;
                     cursor = portal::Point::new(0.0, 0.0);
                     info!("Input focus returned to server");
-                }
-            }
-
-            // Handle client disconnection notifications
-            Some(disconnected_client_name) = disconnect_rx.recv() => {
-                debug!("Received disconnect notification for client '{}'", disconnected_client_name);
-
-                // Check if this client is currently active (has input focus)
-                if let Some(ref client) = active_client {
-                    // If the disconnected client was the active one, release InputCapture
-                    if client.name == disconnected_client_name {
-                        warn!("Active client '{}' disconnected, releasing InputCapture", disconnected_client_name);
-
-                        // Release the InputCapture session
-                        if let Some(activation_id) = current_activation_id {
-                            info!("Releasing InputCapture due to active client disconnect (activation_id={})", activation_id);
-                            if let Err(e) = release_tx.send((Some(activation_id), None)) {
-                                warn!("Failed to send release request: {:?}", e);
-                            }
-                        }
-
-                        // Clear active client and activation ID
-                        active_client = None;
-                        current_activation_id = None;
-                        cursor = portal::Point::new(0.0, 0.0);
-                    }
                 }
             }
 

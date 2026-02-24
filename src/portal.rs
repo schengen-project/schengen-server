@@ -11,7 +11,7 @@ use ashpd::desktop::input_capture::{
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -57,7 +57,6 @@ pub struct DesktopBounds {
 
 /// Portal session wrapper holding the InputCapture session
 pub struct Session {
-    ei_fd: RawFd,
     _owned_fd: OwnedFd,
     /// Receiver for events from the portal
     pub event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
@@ -66,11 +65,6 @@ pub struct Session {
 }
 
 impl Session {
-    /// Get the file descriptor for the EI connection
-    pub fn ei_fd(&self) -> RawFd {
-        self.ei_fd
-    }
-
     /// Split the session into its components
     ///
     /// Returns (OwnedFd, event receiver, event sender)
@@ -250,7 +244,7 @@ async fn setup_barriers(
 ///
 /// # Returns
 ///
-/// Returns a tuple of (portal Session, EI context, barrier map, desktop bounds)
+/// Returns a tuple of (portal Session, barrier map, desktop bounds)
 ///
 /// # Errors
 ///
@@ -259,7 +253,6 @@ pub async fn connect_input_capture(
     client_configs: &HashMap<String, ClientConfig>,
 ) -> Result<(
     Session,
-    ei::EiContext,
     Arc<RwLock<HashMap<u32, (String, Position)>>>,
     Arc<RwLock<DesktopBounds>>,
 )> {
@@ -327,7 +320,16 @@ pub async fn connect_input_capture(
             raw_fd
         );
 
-        // Send the fd back to the main task
+        // Set up EI context for this task
+        let mut ei_context = match ei::connect_with_fd(raw_fd).await {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                warn!("Failed to connect to EI in portal task: {}", e);
+                return;
+            }
+        };
+
+        // Send the fd back to the main task (for keeping the fd alive)
         // We need to duplicate the fd since the original is owned by the spawned task
         let dup_fd = unsafe { libc::dup(raw_fd) };
         if dup_fd < 0 {
@@ -338,7 +340,7 @@ pub async fn connect_input_capture(
         if fd_tx.send(dup_fd).is_err() {
             warn!("Failed to send fd to main task");
             return;
-        }
+        };
 
         // Set up barriers based on zones from InputCapture portal
         info!("Setting up pointer barriers...");
@@ -410,10 +412,48 @@ pub async fn connect_input_capture(
 
         info!("Portal task starting event loop");
 
+        // Track whether we should poll EIS events (only when capture is active)
+        let mut poll_eis = false;
+
         loop {
             use futures_util::StreamExt;
 
             tokio::select! {
+                // Poll EIS events when capture is active
+                _ = ei_context.recv_event(), if poll_eis => {
+                    // Drain all pending input events and forward them
+                    let events = ei_context.take_input_events();
+
+                    if !events.is_empty() {
+                        debug!("ei: Received {} events from portal", events.len());
+
+                        for event in events {
+                            let portal_event = match event {
+                                ei::InputEvent::PointerAbsolute { x, y } => {
+                                    crate::server::Event::PointerAbsolute { x, y }
+                                }
+                                ei::InputEvent::PointerRelative { dx, dy } => {
+                                    crate::server::Event::PointerRelative { dx, dy }
+                                }
+                                ei::InputEvent::Button { button, is_press } => {
+                                    crate::server::Event::Button { button, is_press }
+                                }
+                                ei::InputEvent::Key { keysym, is_press, mask, button } => {
+                                    crate::server::Event::Key { keysym, is_press, mask, button }
+                                }
+                                ei::InputEvent::Scroll { x, y } => {
+                                    crate::server::Event::Scroll { x, y }
+                                }
+                            };
+
+                            if portal_to_server_tx.send(portal_event).is_err() {
+                                warn!("Failed to send input event (receiver dropped)");
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 // Handle activated events from the portal
                 Some(activated) = activated_stream.next() => {
                     info!("Activated signal received!");
@@ -478,6 +518,9 @@ pub async fn connect_input_capture(
                         break;
                     }
                     info!("✓ Activation event forwarded to server");
+
+                    // Start polling EIS events now that capture is active
+                    poll_eis = true;
                 }
 
                 // Handle zones_changed events from the portal
@@ -520,6 +563,9 @@ pub async fn connect_input_capture(
                             } else {
                                 info!("✓ InputCapture session released");
                             }
+
+                            // Stop polling EIS events since capture is no longer active
+                            poll_eis = false;
                         }
                         crate::server::Event::EnableCapture if !is_enabled => {
                             info!("Enabling InputCapture session...");
@@ -570,14 +616,10 @@ pub async fn connect_input_capture(
     let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
     let portal_session = Session {
-        ei_fd: raw_fd,
         _owned_fd: owned_fd,
         event_rx: portal_to_server_rx,
         event_tx: server_to_portal_tx,
     };
 
-    // Now connect to EI and get the context with devices
-    let ei_context = ei::connect_with_fd(portal_session.ei_fd()).await?;
-
-    Ok((portal_session, ei_context, barrier_map, desktop_bounds))
+    Ok((portal_session, barrier_map, desktop_bounds))
 }

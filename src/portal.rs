@@ -110,7 +110,7 @@ async fn setup_barriers(
     proxy: &InputCapture,
     session: &ashpd::desktop::Session<InputCapture>,
     client_configs: &HashMap<String, ClientConfig>,
-) -> Result<(HashMap<u32, String>, DesktopBounds)> {
+) -> Result<(HashMap<u32, (String, Position)>, DesktopBounds)> {
     // Query zones from the InputCapture portal
     info!("Querying zones from InputCapture portal...");
     let zones = proxy
@@ -161,7 +161,7 @@ async fn setup_barriers(
 
     let mut barriers = Vec::new();
     let mut barrier_id = 1u32;
-    let mut barrier_map = HashMap::new();
+    let mut barrier_map: HashMap<u32, (String, Position)> = HashMap::new();
 
     // Create barriers only on the outer edges of the entire desktop
     for (client_name, config) in client_configs {
@@ -207,7 +207,7 @@ async fn setup_barriers(
         };
 
         barriers.push(barrier);
-        barrier_map.insert(barrier_id, client_name.clone());
+        barrier_map.insert(barrier_id, (client_name.clone(), config.position));
         barrier_id += 1;
     }
 
@@ -263,7 +263,7 @@ pub async fn connect_input_capture(
 ) -> Result<(
     Session,
     ei::EiContext,
-    Arc<RwLock<HashMap<u32, String>>>,
+    Arc<RwLock<HashMap<u32, (String, Position)>>>,
     Arc<RwLock<DesktopBounds>>,
 )> {
     info!("Connecting to InputCapture portal");

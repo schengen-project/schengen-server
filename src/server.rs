@@ -188,7 +188,7 @@ impl Server<PortalConnected> {
         let barrier_task = tokio::spawn(async move {
             // Keep _owned_fd alive for the lifetime of the task
             let _keep_alive = _owned_fd;
-            if let Err(e) = handle_barrier_events(
+            handle_barrier_events(
                 barrier_server,
                 activated_rx,
                 ei_context,
@@ -198,9 +198,6 @@ impl Server<PortalConnected> {
                 disconnect_rx,
             )
             .await
-            {
-                warn!("Barrier event handler error: {}", e);
-            }
         });
 
         // Main event loop - handle server events

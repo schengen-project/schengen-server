@@ -140,8 +140,8 @@ impl Server<portal::InputCapturePortal> {
     ///
     /// Returns an error if the server fails to start or encounters a fatal error
     pub async fn run(self) -> Result<()> {
-        let portal_session = self.state.portal_session;
-        let desktop_bounds = self.state.desktop_bounds;
+        let input_capture = self.state;
+        let desktop_bounds = Arc::clone(&input_capture.desktop_bounds);
 
         let listen_addr: SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
@@ -215,24 +215,15 @@ impl Server<portal::InputCapturePortal> {
 
         let server = Arc::new(server);
 
-        // Split portal session to extract components
-        let (_owned_fd, mut event_rx, event_tx) = portal_session.split();
+        // Clone the event sender for the main server task
+        let event_tx = input_capture.event_tx.clone();
 
         // Clone server for the barrier event handler
         let barrier_server = Arc::clone(&server);
-        let event_tx_clone = event_tx.clone();
 
         // Spawn a task to handle barrier events
         let barrier_task = tokio::spawn(async move {
-            // Keep _owned_fd alive for the lifetime of the task
-            let _keep_alive = _owned_fd;
-            handle_barrier_events(
-                barrier_server,
-                &mut event_rx,
-                event_tx_clone,
-                desktop_bounds,
-            )
-            .await
+            handle_barrier_events(barrier_server, input_capture, desktop_bounds).await
         });
 
         // Main event loop - handle server events
@@ -325,8 +316,7 @@ impl Server<portal::InputCapturePortal> {
 /// # Arguments
 ///
 /// * `server` - The schengen server for sending messages to clients
-/// * `event_rx` - Receiver for events from the portal
-/// * `event_tx` - Sender for events to the portal
+/// * `input_capture` - InputCapture portal containing event channels
 /// * `desktop_bounds` - Desktop bounds for checking if pointer is back on server
 ///
 /// # Errors
@@ -334,8 +324,7 @@ impl Server<portal::InputCapturePortal> {
 /// Returns an error if receiving events fails
 async fn handle_barrier_events(
     server: Arc<schengen::server::Server>,
-    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
-    event_tx: tokio::sync::mpsc::UnboundedSender<Event>,
+    mut input_capture: portal::InputCapturePortal,
     desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
 ) -> Result<()> {
     info!("Starting barrier event handler");
@@ -352,7 +341,7 @@ async fn handle_barrier_events(
     loop {
         tokio::select! {
             // Handle all events from portal (including input events)
-            Some(event) = event_rx.recv() => {
+            Some(event) = input_capture.event_rx.recv() => {
                 match event {
                     Event::Activated {
                         client_name,
@@ -462,7 +451,7 @@ async fn handle_barrier_events(
                                 // Release the InputCapture session
                                 if let Some(activation_id) = current_activation_id {
                                     info!("Releasing InputCapture due to active client disconnect (activation_id={})", activation_id);
-                                    if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                                    if let Err(e) = input_capture.event_tx.send(Event::ReleaseCapture {
                                         activation_id: Some(activation_id),
                                         cursor: None,
                                     }) {
@@ -531,7 +520,7 @@ async fn handle_barrier_events(
                             // Release the InputCapture session
                             if let Some(activation_id) = current_activation_id {
                                 info!("Releasing InputCapture (activation_id={}, cursor=({:.2}, {:.2}))", activation_id, cursor.x, cursor.y);
-                                if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                                if let Err(e) = input_capture.event_tx.send(Event::ReleaseCapture {
                                     activation_id: Some(activation_id),
                                     cursor: Some(cursor),
                                 }) {
@@ -556,7 +545,7 @@ async fn handle_barrier_events(
                                 // Client disconnected, clear active client and release portal
                                 if let Some(activation_id) = current_activation_id {
                                     info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                                    let _ = event_tx.send(Event::ReleaseCapture {
+                                    let _ = input_capture.event_tx.send(Event::ReleaseCapture {
                                         activation_id: Some(activation_id),
                                         cursor: None,
                                     });
@@ -622,7 +611,7 @@ async fn handle_barrier_events(
                             // Release the InputCapture session
                             if let Some(activation_id) = current_activation_id {
                                 info!("Releasing InputCapture (activation_id={}, cursor=({:.2}, {:.2}))", activation_id, cursor.x, cursor.y);
-                                if let Err(e) = event_tx.send(Event::ReleaseCapture {
+                                if let Err(e) = input_capture.event_tx.send(Event::ReleaseCapture {
                                     activation_id: Some(activation_id),
                                     cursor: Some(cursor),
                                 }) {
@@ -647,7 +636,7 @@ async fn handle_barrier_events(
                                 // Client disconnected, clear active client and release portal
                                 if let Some(activation_id) = current_activation_id {
                                     info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                                    let _ = event_tx.send(Event::ReleaseCapture {
+                                    let _ = input_capture.event_tx.send(Event::ReleaseCapture {
                                         activation_id: Some(activation_id),
                                         cursor: None,
                                     });
@@ -676,7 +665,7 @@ async fn handle_barrier_events(
                             // Client disconnected, clear active client and release portal
                             if let Some(activation_id) = current_activation_id {
                                 info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                                let _ = event_tx.send(Event::ReleaseCapture {
+                                let _ = input_capture.event_tx.send(Event::ReleaseCapture {
                                     activation_id: Some(activation_id),
                                     cursor: None,
                                 });
@@ -704,7 +693,7 @@ async fn handle_barrier_events(
                             // Client disconnected, clear active client and release portal
                             if let Some(activation_id) = current_activation_id {
                                 info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                                let _ = event_tx.send(Event::ReleaseCapture {
+                                let _ = input_capture.event_tx.send(Event::ReleaseCapture {
                                     activation_id: Some(activation_id),
                                     cursor: None,
                                 });
@@ -729,7 +718,7 @@ async fn handle_barrier_events(
                             // Client disconnected, clear active client and release portal
                             if let Some(activation_id) = current_activation_id {
                                 info!("Releasing InputCapture due to client disconnect (activation_id={})", activation_id);
-                                let _ = event_tx.send(Event::ReleaseCapture {
+                                let _ = input_capture.event_tx.send(Event::ReleaseCapture {
                                     activation_id: Some(activation_id),
                                     cursor: None,
                                 });

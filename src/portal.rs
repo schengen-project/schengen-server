@@ -11,7 +11,7 @@ use ashpd::desktop::input_capture::{
 use log::{debug, info, warn};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -55,9 +55,13 @@ pub struct DesktopBounds {
     pub max_y: i32,
 }
 
-/// A connected InputCapture portal with session and desktop bounds
+/// A connected InputCapture portal with event channels and desktop bounds
 pub struct InputCapturePortal {
-    pub portal_session: Session,
+    /// Receiver for events from the portal
+    pub event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    /// Sender to send events to the portal
+    pub event_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+    /// Desktop bounds for coordinate mapping
     pub desktop_bounds: Arc<RwLock<DesktopBounds>>,
 }
 
@@ -82,30 +86,6 @@ impl InputCapturePortal {
     /// Returns an error if the portal connection fails or permissions are denied
     pub async fn new(client_configs: &HashMap<String, ClientConfig>) -> Result<Self> {
         connect_input_capture_impl(client_configs).await
-    }
-}
-
-/// Portal session wrapper holding the InputCapture session
-pub struct Session {
-    _owned_fd: OwnedFd,
-    /// Receiver for events from the portal
-    pub event_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
-    /// Sender to send events to the portal
-    pub event_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
-}
-
-impl Session {
-    /// Split the session into its components
-    ///
-    /// Returns (OwnedFd, event receiver, event sender)
-    pub fn split(
-        self,
-    ) -> (
-        OwnedFd,
-        tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
-        tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
-    ) {
-        (self._owned_fd, self.event_rx, self.event_tx)
     }
 }
 
@@ -289,11 +269,6 @@ async fn connect_input_capture_impl(
     let desktop_bounds_clone = Arc::clone(&desktop_bounds);
     let client_configs_arc = Arc::new(client_configs.clone());
 
-    // We need to create the session, get the EI fd, and then spawn the monitoring task
-    // The monitoring task will own proxy and session for their lifetimes
-    // Create a oneshot channel to get the fd back from the spawned task
-    let (fd_tx, fd_rx) = tokio::sync::oneshot::channel();
-
     // Create event channels for bidirectional communication
     // portal_to_server: portal task sends events to server
     // server_to_portal: server sends events to portal task
@@ -314,7 +289,8 @@ async fn connect_input_capture_impl(
         debug!("InputCapture session created");
 
         // Connect to the EI (Emulated Input) socket
-        let owned_fd = match proxy
+        // Keep the owned_fd alive for the lifetime of this task
+        let _owned_fd = match proxy
             .connect_to_eis(&session, ConnectToEISOptions::default())
             .await
         {
@@ -325,7 +301,7 @@ async fn connect_input_capture_impl(
             }
         };
 
-        let raw_fd = owned_fd.as_raw_fd();
+        let raw_fd = _owned_fd.as_raw_fd();
         info!(
             "InputCapture portal connected successfully (fd: {})",
             raw_fd
@@ -338,19 +314,6 @@ async fn connect_input_capture_impl(
                 warn!("Failed to connect to EI in portal task: {}", e);
                 return;
             }
-        };
-
-        // Send the fd back to the main task (for keeping the fd alive)
-        // We need to duplicate the fd since the original is owned by the spawned task
-        let dup_fd = unsafe { libc::dup(raw_fd) };
-        if dup_fd < 0 {
-            warn!("Failed to duplicate fd");
-            return;
-        }
-
-        if fd_tx.send(dup_fd).is_err() {
-            warn!("Failed to send fd to main task");
-            return;
         };
 
         // Set up barriers based on zones from InputCapture portal
@@ -620,20 +583,9 @@ async fn connect_input_capture_impl(
         "Portal task spawned, task will monitor for zone changes, activations, and release requests"
     );
 
-    // Wait for the fd from the spawned task
-    let raw_fd = fd_rx
-        .await
-        .context("Failed to receive fd from portal task")?;
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-
-    let portal_session = Session {
-        _owned_fd: owned_fd,
+    Ok(InputCapturePortal {
         event_rx: portal_to_server_rx,
         event_tx: server_to_portal_tx,
-    };
-
-    Ok(InputCapturePortal {
-        portal_session,
         desktop_bounds,
     })
 }

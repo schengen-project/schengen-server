@@ -85,309 +85,128 @@ impl InputCapturePortal {
     ///
     /// Returns an error if the portal connection fails or permissions are denied
     pub async fn new(client_configs: &HashMap<String, ClientConfig>) -> Result<Self> {
-        connect_input_capture_impl(client_configs).await
-    }
-}
+        info!("Connecting to InputCapture portal");
 
-/// Set up pointer barriers based on zones from InputCapture portal
-///
-/// This queries the zones from the InputCapture portal and creates barriers
-/// at the edges of each zone based on the configured client positions.
-///
-/// # Arguments
-///
-/// * `proxy` - The InputCapture proxy
-/// * `session` - The portal session handle
-/// * `client_configs` - Map of client names to their position configurations
-///
-/// # Returns
-///
-/// Returns a tuple of (barrier map, desktop bounds)
-///
-/// # Errors
-///
-/// Returns an error if querying zones or setting barriers fails
-async fn setup_barriers(
-    proxy: &InputCapture,
-    session: &ashpd::desktop::Session<InputCapture>,
-    client_configs: &HashMap<String, ClientConfig>,
-) -> Result<(HashMap<u32, (String, Position)>, DesktopBounds)> {
-    // Query zones from the InputCapture portal
-    info!("Querying zones from InputCapture portal...");
-    let zones = proxy
-        .zones(session, GetZonesOptions::default())
-        .await
-        .context("Failed to request zones")?
-        .response()
-        .context("Failed to get zones response")?;
-
-    info!(
-        "Received {} zone(s) with zone_set ID: {}",
-        zones.regions().len(),
-        zones.zone_set()
-    );
-
-    // Calculate the bounding box of all zones (the entire desktop)
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
-
-    for (zone_idx, zone) in zones.regions().iter().enumerate() {
-        let x = zone.x_offset();
-        let y = zone.y_offset();
-        let width = zone.width();
-        let height = zone.height();
-
-        info!(
-            "Zone {}: offset=({}, {}), size={}x{}",
-            zone_idx, x, y, width, height
-        );
-
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x + width as i32);
-        max_y = max_y.max(y + height as i32);
-    }
-
-    info!(
-        "Desktop bounding box: ({}, {}) to ({}, {}) [{}x{}]",
-        min_x,
-        min_y,
-        max_x,
-        max_y,
-        max_x - min_x,
-        max_y - min_y
-    );
-
-    let mut barriers = Vec::new();
-    let mut barrier_id = 1u32;
-    let mut barrier_map: HashMap<u32, (String, Position)> = HashMap::new();
-
-    // Create barriers only on the outer edges of the entire desktop
-    for (client_name, config) in client_configs {
-        // Only create barriers for clients positioned relative to the server (self)
-        if config.reference != "self" {
-            continue;
-        }
-
-        let barrier_id_nonzero = NonZeroU32::new(barrier_id).unwrap();
-        let barrier = match config.position {
-            Position::LeftOf => {
-                // Client is to the left, so barrier on left edge of desktop
-                info!(
-                    "  Adding left barrier (ID {}) for client '{}'",
-                    barrier_id, client_name
-                );
-                Barrier::new(barrier_id_nonzero, (min_x, min_y, min_x, max_y))
-            }
-            Position::RightOf => {
-                // Client is to the right, so barrier on right edge of desktop
-                info!(
-                    "  Adding right barrier (ID {}) for client '{}'",
-                    barrier_id, client_name
-                );
-                Barrier::new(barrier_id_nonzero, (max_x, min_y, max_x, max_y))
-            }
-            Position::TopOf => {
-                // Client is above, so barrier on top edge of desktop
-                info!(
-                    "  Adding top barrier (ID {}) for client '{}'",
-                    barrier_id, client_name
-                );
-                Barrier::new(barrier_id_nonzero, (min_x, min_y, max_x, min_y))
-            }
-            Position::BottomOf => {
-                // Client is below, so barrier on bottom edge of desktop
-                info!(
-                    "  Adding bottom barrier (ID {}) for client '{}'",
-                    barrier_id, client_name
-                );
-                Barrier::new(barrier_id_nonzero, (min_x, max_y, max_x, max_y))
-            }
-        };
-
-        barriers.push(barrier);
-        barrier_map.insert(barrier_id, (client_name.clone(), config.position));
-        barrier_id += 1;
-    }
-
-    info!(
-        "Setting {} pointer barrier(s) with zone_set {}",
-        barriers.len(),
-        zones.zone_set()
-    );
-    proxy
-        .set_pointer_barriers(
-            session,
-            &barriers,
-            zones.zone_set(),
-            SetPointerBarriersOptions::default(),
-        )
-        .await
-        .context("Failed to set pointer barriers")?
-        .response()
-        .context("Failed to get set_pointer_barriers response")?;
-
-    info!("✓ Pointer barriers configured");
-
-    let desktop_bounds = DesktopBounds {
-        min_x,
-        min_y,
-        max_x,
-        max_y,
-    };
-
-    Ok((barrier_map, desktop_bounds))
-}
-
-/// Implementation function for connecting to the InputCapture portal
-///
-/// This is called by InputCapturePortal::new()
-async fn connect_input_capture_impl(
-    client_configs: &HashMap<String, ClientConfig>,
-) -> Result<InputCapturePortal> {
-    info!("Connecting to InputCapture portal");
-
-    let proxy = InputCapture::new()
-        .await
-        .context("Failed to create InputCapture proxy")?;
-
-    // Get capabilities - we want both keyboard and pointer
-    let capabilities = ashpd::desktop::input_capture::Capabilities::Keyboard
-        | ashpd::desktop::input_capture::Capabilities::Pointer;
-
-    // Create the barrier map and desktop bounds that will be shared
-    let barrier_map = Arc::new(RwLock::new(HashMap::new()));
-    let barrier_map_clone = Arc::clone(&barrier_map);
-    let desktop_bounds = Arc::new(RwLock::new(DesktopBounds {
-        min_x: 0,
-        min_y: 0,
-        max_x: 1920, // Default, will be updated after setup_barriers
-        max_y: 1080,
-    }));
-    let desktop_bounds_clone = Arc::clone(&desktop_bounds);
-    let client_configs_arc = Arc::new(client_configs.clone());
-
-    // Create event channels for bidirectional communication
-    // portal_to_server: portal task sends events to server
-    // server_to_portal: server sends events to portal task
-    let (portal_to_server_tx, portal_to_server_rx) = tokio::sync::mpsc::unbounded_channel();
-    let (server_to_portal_tx, mut server_to_portal_rx) = tokio::sync::mpsc::unbounded_channel();
-
-    tokio::spawn(async move {
-        // Create session inside the spawned task
-        let opts = CreateSessionOptions::default().set_capabilities(capabilities);
-        let (session, _caps) = match proxy.create_session(None, opts).await {
-            Ok(result) => result,
-            Err(e) => {
-                warn!("Failed to create InputCapture session: {}", e);
-                return;
-            }
-        };
-
-        debug!("InputCapture session created");
-
-        // Connect to the EI (Emulated Input) socket
-        // Keep the owned_fd alive for the lifetime of this task
-        let _owned_fd = match proxy
-            .connect_to_eis(&session, ConnectToEISOptions::default())
+        let proxy = InputCapture::new()
             .await
-        {
-            Ok(fd) => fd,
-            Err(e) => {
-                warn!("Failed to connect to EIS: {}", e);
-                return;
-            }
-        };
+            .context("Failed to create InputCapture proxy")?;
 
-        let raw_fd = _owned_fd.as_raw_fd();
-        info!(
-            "InputCapture portal connected successfully (fd: {})",
-            raw_fd
+        // Create shared state for the portal task
+        let barrier_map = Arc::new(RwLock::new(HashMap::new()));
+        let desktop_bounds = Arc::new(RwLock::new(DesktopBounds {
+            min_x: 0,
+            min_y: 0,
+            max_x: 1920, // Default, will be updated after setup_barriers
+            max_y: 1080,
+        }));
+
+        let (portal_to_server_tx, portal_to_server_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (server_to_portal_tx, server_to_portal_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        Self::spawn_portal_monitor_task(
+            proxy,
+            Arc::clone(&barrier_map),
+            Arc::clone(&desktop_bounds),
+            client_configs.clone(),
+            portal_to_server_tx,
+            server_to_portal_rx,
         );
 
-        // Set up EI context for this task
-        let mut ei_context = match ei::connect_with_fd(raw_fd).await {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                warn!("Failed to connect to EI in portal task: {}", e);
-                return;
-            }
-        };
+        info!(
+            "Portal task spawned, task will monitor for zone changes, activations, and release requests"
+        );
 
-        // Set up barriers based on zones from InputCapture portal
-        info!("Setting up pointer barriers...");
-        match setup_barriers(&proxy, &session, &client_configs_arc).await {
-            Ok((map, bounds)) => {
-                *barrier_map_clone.write().await = map;
-                *desktop_bounds_clone.write().await = bounds;
-            }
-            Err(e) => {
-                warn!("Failed to setup initial barriers: {}", e);
-                return;
-            }
-        }
+        Ok(InputCapturePortal {
+            event_rx: portal_to_server_rx,
+            event_tx: server_to_portal_tx,
+            desktop_bounds,
+        })
+    }
 
-        // Wait for signal to enable the InputCapture session
-        // This will be sent when the first client connects
-        info!("Waiting for first client connection before enabling InputCapture...");
-        let mut is_enabled = false;
-        loop {
-            match server_to_portal_rx.recv().await {
-                Some(crate::server::Event::EnableCapture) if !is_enabled => {
-                    info!("Received enable command");
-                    break;
-                }
-                Some(crate::server::Event::DisableCapture) if is_enabled => {
-                    // Will handle in main loop below
-                    warn!("Received disable before initial enable, ignoring");
-                }
-                Some(_) => {
-                    // Ignore redundant commands
-                }
-                None => {
-                    warn!("Event channel closed, not enabling InputCapture");
-                    return;
-                }
+    /// Spawn the background task that monitors the portal
+    fn spawn_portal_monitor_task(
+        proxy: InputCapture,
+        barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: Arc<RwLock<DesktopBounds>>,
+        client_configs: HashMap<String, ClientConfig>,
+        portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+        mut server_to_portal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    ) {
+        tokio::spawn(async move {
+            if let Err(e) = Self::run_portal_monitor(
+                proxy,
+                barrier_map,
+                desktop_bounds,
+                client_configs,
+                portal_to_server_tx,
+                &mut server_to_portal_rx,
+            )
+            .await
+            {
+                warn!("Portal monitor task error: {}", e);
             }
-        }
+            warn!("Portal monitor task exiting!");
+        });
+    }
 
-        // Subscribe to signals BEFORE enabling the session
+    /// Main portal monitoring loop
+    async fn run_portal_monitor(
+        proxy: InputCapture,
+        barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: Arc<RwLock<DesktopBounds>>,
+        client_configs: HashMap<String, ClientConfig>,
+        portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+        server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    ) -> Result<()> {
+        // Get capabilities - we want both keyboard and pointer
+        let capabilities = ashpd::desktop::input_capture::Capabilities::Keyboard
+            | ashpd::desktop::input_capture::Capabilities::Pointer;
+
+        // Create session and connect to EI
+        let (session, ei_context) =
+            Self::create_session_and_connect_ei(&proxy, capabilities).await?;
+
+        // Set up barriers
+        Self::setup_initial_barriers(
+            &proxy,
+            &session,
+            &client_configs,
+            &barrier_map,
+            &desktop_bounds,
+        )
+        .await?;
+
+        // Wait for initial enable signal
+        Self::wait_for_initial_enable(server_to_portal_rx).await?;
+
+        // Subscribe to portal signals
         debug!("Subscribing to zones_changed signal...");
-        let mut zones_changed_stream = match proxy.receive_zones_changed().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                warn!("Failed to subscribe to zones_changed signal: {}", e);
-                return;
-            }
-        };
+        let zones_changed_stream = proxy
+            .receive_zones_changed()
+            .await
+            .context("Failed to subscribe to zones_changed signal")?;
 
         debug!("Subscribing to activated signal...");
-        let mut activated_stream = match proxy.receive_activated().await {
-            Ok(stream) => {
-                info!("✓ Successfully subscribed to activated signal");
-                stream
-            }
-            Err(e) => {
-                warn!("Failed to subscribe to activated signal: {}", e);
-                return;
-            }
-        };
+        let activated_stream = proxy
+            .receive_activated()
+            .await
+            .context("Failed to subscribe to activated signal")?;
+        info!("✓ Successfully subscribed to activated signal");
 
-        // Enable the InputCapture session (after subscribing to signals)
-        info!("Enabling InputCapture session...");
-        if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
-            warn!("Failed to enable InputCapture session: {}", e);
-            return;
-        }
-        is_enabled = true;
+        // Enable the session
+        proxy
+            .enable(&session, EnableOptions::default())
+            .await
+            .context("Failed to enable InputCapture session")?;
         info!("✓ InputCapture session enabled");
 
+        // Run the main event loop
         info!("Portal task starting event loop");
-
-        // Track whether we should poll EIS events (only when capture is active)
+        let mut is_enabled = true;
         let mut poll_eis = false;
+        let mut ei_context = ei_context;
+        let mut zones_changed_stream = zones_changed_stream;
+        let mut activated_stream = activated_stream;
 
         loop {
             use futures_util::StreamExt;
@@ -395,178 +214,42 @@ async fn connect_input_capture_impl(
             tokio::select! {
                 // Poll EIS events when capture is active
                 _ = ei_context.recv_event(), if poll_eis => {
-                    // Drain all pending input events and forward them
-                    let events = ei_context.take_input_events();
-
-                    if !events.is_empty() {
-                        debug!("ei: Received {} events from portal", events.len());
-
-                        for event in events {
-                            let portal_event = match event {
-                                ei::InputEvent::PointerAbsolute { x, y } => {
-                                    crate::server::Event::PointerAbsolute { x, y }
-                                }
-                                ei::InputEvent::PointerRelative { dx, dy } => {
-                                    crate::server::Event::PointerRelative { dx, dy }
-                                }
-                                ei::InputEvent::Button { button, is_press } => {
-                                    crate::server::Event::Button { button, is_press }
-                                }
-                                ei::InputEvent::Key { keysym, is_press, mask, button } => {
-                                    crate::server::Event::Key { keysym, is_press, mask, button }
-                                }
-                                ei::InputEvent::Scroll { x, y } => {
-                                    crate::server::Event::Scroll { x, y }
-                                }
-                            };
-
-                            if portal_to_server_tx.send(portal_event).is_err() {
-                                warn!("Failed to send input event (receiver dropped)");
-                                break;
-                            }
-                        }
+                    if !Self::handle_ei_events(&mut ei_context, &portal_to_server_tx) {
+                        break;
                     }
                 }
 
                 // Handle activated events from the portal
                 Some(activated) = activated_stream.next() => {
-                    info!("Activated signal received!");
-
-                    // Extract activation ID and cursor position
-                    let activation_id = match activated.activation_id() {
-                        Some(id) => id,
-                        None => {
-                            warn!("Activated event without activation ID");
-                            continue;
-                        }
-                    };
-
-                    let barrier_id = match activated.barrier_id() {
-                        Some(ashpd::desktop::input_capture::ActivatedBarrier::Barrier(id)) => {
-                            id.get()
-                        }
-                        Some(ashpd::desktop::input_capture::ActivatedBarrier::UnknownBarrier) => {
-                            warn!("Activated event with unknown barrier");
-                            continue;
-                        }
-                        None => {
-                            warn!("Activated event without barrier ID");
-                            continue;
-                        }
-                    };
-
-                    let cursor = match activated.cursor_position() {
-                        Some((x, y)) => Point::new(x as f64, y as f64),
-                        None => {
-                            warn!("Activated event without cursor position");
-                            Point::new(0.0, 0.0)
-                        }
-                    };
-
-                    info!(
-                        "Portal activated! Activation ID: {}, Barrier ID: {}, Position: ({:.2}, {:.2})",
-                        activation_id, barrier_id, cursor.x, cursor.y
-                    );
-
-                    // Look up client info from barrier map
-                    let barrier_lookup = barrier_map_clone.read().await;
-                    let (client_name, client_position) = match barrier_lookup.get(&barrier_id) {
-                        Some((name, position)) => (name.clone(), *position),
-                        None => {
-                            warn!("Unknown barrier ID: {} (no client mapping found)", barrier_id);
-                            continue;
-                        }
-                    };
-                    drop(barrier_lookup);
-
-                    // Send the activated event through the channel
-                    let event = crate::server::Event::Activated {
-                        client_name,
-                        client_position,
-                        activation_id,
-                        cursor,
-                    };
-
-                    if portal_to_server_tx.send(event).is_err() {
-                        warn!("Failed to send activated event (receiver dropped)");
-                        break;
+                    if Self::handle_activated_event(activated, &barrier_map, &portal_to_server_tx).await {
+                        // Start polling EIS events now that capture is active
+                        poll_eis = true;
                     }
-                    info!("✓ Activation event forwarded to server");
-
-                    // Start polling EIS events now that capture is active
-                    poll_eis = true;
                 }
 
                 // Handle zones_changed events from the portal
                 Some(zones_changed) = zones_changed_stream.next() => {
-                    info!(
-                        "Zones changed: session={:?}, zone_set={:?}",
-                        zones_changed.session_handle(),
-                        zones_changed.zone_set()
-                    );
-
-                    // Re-setup barriers with the new zones
-                    match setup_barriers(&proxy, &session, &client_configs_arc).await {
-                        Ok((map, bounds)) => {
-                            *barrier_map_clone.write().await = map;
-                            *desktop_bounds_clone.write().await = bounds;
-                            info!("✓ Barriers re-configured after zone change");
-
-                            // Re-enable the session after reconfiguring barriers
-                            if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
-                                warn!("Failed to re-enable InputCapture session after zone change: {}", e);
-                            } else {
-                                info!("✓ InputCapture session re-enabled");
-                            }
-                        }
-                        Err(e) => {
-                            warn!("Failed to re-setup barriers after zone change: {}", e);
-                        }
-                    }
+                    Self::handle_zones_changed_event(
+                        zones_changed,
+                        &proxy,
+                        &session,
+                        &client_configs,
+                        &barrier_map,
+                        &desktop_bounds,
+                    ).await;
                 }
 
                 // Handle events from server
                 Some(event) = server_to_portal_rx.recv() => {
-                    match event {
-                        crate::server::Event::ReleaseCapture { activation_id, cursor } => {
-                            info!("Releasing InputCapture session: activation_id={:?}, cursor={:?}", activation_id, cursor);
-                            let cursor_tuple = cursor.map(|p| (p.x, p.y));
-                            let opts = ReleaseOptions::default().set_activation_id(activation_id).set_cursor_position(cursor_tuple);
-                            if let Err(e) = proxy.release(&session, opts).await {
-                                warn!("Failed to release InputCapture session: {}", e);
-                            } else {
-                                info!("✓ InputCapture session released");
-                            }
-
-                            // Stop polling EIS events since capture is no longer active
-                            poll_eis = false;
-                        }
-                        crate::server::Event::EnableCapture if !is_enabled => {
-                            info!("Enabling InputCapture session...");
-                            if let Err(e) = proxy.enable(&session, EnableOptions::default()).await {
-                                warn!("Failed to enable InputCapture session: {}", e);
-                            } else {
-                                is_enabled = true;
-                                info!("✓ InputCapture session enabled");
-                            }
-                        }
-                        crate::server::Event::DisableCapture if is_enabled => {
-                            info!("Disabling InputCapture session...");
-                            if let Err(e) = proxy.disable(&session, DisableOptions::default()).await {
-                                warn!("Failed to disable InputCapture session: {}", e);
-                            } else {
-                                is_enabled = false;
-                                info!("✓ InputCapture session disabled");
-                            }
-                        }
-                        crate::server::Event::EnableCapture | crate::server::Event::DisableCapture => {
-                            // Ignore redundant enable/disable commands
-                            debug!("Ignoring redundant {:?} command (is_enabled={})", event, is_enabled);
-                        }
-                        _ => {
-                            warn!("Portal received unexpected event: {:?}", event);
-                        }
-                    }
+                    let (new_is_enabled, new_poll_eis) = Self::handle_server_event(
+                        event,
+                        &proxy,
+                        &session,
+                        is_enabled,
+                        poll_eis,
+                    ).await;
+                    is_enabled = new_is_enabled;
+                    poll_eis = new_poll_eis;
                 }
 
                 else => {
@@ -577,15 +260,484 @@ async fn connect_input_capture_impl(
         }
 
         warn!("Portal monitor task exiting!");
-    });
+        Ok(())
+    }
 
-    info!(
-        "Portal task spawned, task will monitor for zone changes, activations, and release requests"
-    );
+    /// Create portal session and connect to EI
+    async fn create_session_and_connect_ei(
+        proxy: &InputCapture,
+        capabilities: ashpd::enumflags2::BitFlags<ashpd::desktop::input_capture::Capabilities>,
+    ) -> Result<(ashpd::desktop::Session<InputCapture>, ei::EiContext)> {
+        let opts = CreateSessionOptions::default().set_capabilities(capabilities);
+        let (session, _caps) = proxy
+            .create_session(None, opts)
+            .await
+            .context("Failed to create InputCapture session")?;
 
-    Ok(InputCapturePortal {
-        event_rx: portal_to_server_rx,
-        event_tx: server_to_portal_tx,
-        desktop_bounds,
-    })
+        debug!("InputCapture session created");
+
+        // Connect to the EI (Emulated Input) socket
+        let _owned_fd = proxy
+            .connect_to_eis(&session, ConnectToEISOptions::default())
+            .await
+            .context("Failed to connect to EIS")?;
+
+        let raw_fd = _owned_fd.as_raw_fd();
+        info!(
+            "InputCapture portal connected successfully (fd: {})",
+            raw_fd
+        );
+
+        // Set up EI context
+        let ei_context = ei::connect_with_fd(raw_fd)
+            .await
+            .context("Failed to connect to EI in portal task")?;
+
+        // Keep the fd alive by storing it in the EI context (it will be dropped when the task ends)
+        std::mem::forget(_owned_fd);
+
+        Ok((session, ei_context))
+    }
+
+    /// Set up initial barriers
+    async fn setup_initial_barriers(
+        proxy: &InputCapture,
+        session: &ashpd::desktop::Session<InputCapture>,
+        client_configs: &HashMap<String, ClientConfig>,
+        barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: &Arc<RwLock<DesktopBounds>>,
+    ) -> Result<()> {
+        info!("Setting up pointer barriers...");
+        let (map, bounds) = Self::setup_barriers(proxy, session, client_configs)
+            .await
+            .context("Failed to setup initial barriers")?;
+
+        *barrier_map.write().await = map;
+        *desktop_bounds.write().await = bounds;
+
+        Ok(())
+    }
+
+    /// Wait for the initial enable signal from the server
+    async fn wait_for_initial_enable(
+        server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    ) -> Result<()> {
+        info!("Waiting for first client connection before enabling InputCapture...");
+
+        loop {
+            match server_to_portal_rx.recv().await {
+                Some(crate::server::Event::EnableCapture) => {
+                    info!("Received enable command");
+                    return Ok(());
+                }
+                Some(crate::server::Event::DisableCapture) => {
+                    warn!("Received disable before initial enable, ignoring");
+                }
+                Some(_) => {
+                    // Ignore other events
+                }
+                None => {
+                    anyhow::bail!("Event channel closed before enable");
+                }
+            }
+        }
+    }
+
+    /// Handle EIS input events and forward them to the server
+    ///
+    /// Drains all pending input events from the EI context and forwards them
+    /// through the channel to the server.
+    ///
+    /// # Returns
+    ///
+    /// Returns `false` if the receiver dropped (channel closed), `true` otherwise
+    fn handle_ei_events(
+        ei_context: &mut ei::EiContext,
+        portal_to_server_tx: &tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+    ) -> bool {
+        let events = ei_context.take_input_events();
+
+        if !events.is_empty() {
+            debug!("ei: Received {} events from portal", events.len());
+
+            for event in events {
+                let portal_event = match event {
+                    ei::InputEvent::PointerAbsolute { x, y } => {
+                        crate::server::Event::PointerAbsolute { x, y }
+                    }
+                    ei::InputEvent::PointerRelative { dx, dy } => {
+                        crate::server::Event::PointerRelative { dx, dy }
+                    }
+                    ei::InputEvent::Button { button, is_press } => {
+                        crate::server::Event::Button { button, is_press }
+                    }
+                    ei::InputEvent::Key {
+                        keysym,
+                        is_press,
+                        mask,
+                        button,
+                    } => crate::server::Event::Key {
+                        keysym,
+                        is_press,
+                        mask,
+                        button,
+                    },
+                    ei::InputEvent::Scroll { x, y } => crate::server::Event::Scroll { x, y },
+                };
+
+                if portal_to_server_tx.send(portal_event).is_err() {
+                    warn!("Failed to send input event (receiver dropped)");
+                    return false;
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Handle activated event from the portal
+    ///
+    /// Processes a barrier activation event by extracting the activation details,
+    /// looking up the client information, and forwarding the event to the server.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if the event was processed successfully (EIS polling should be enabled),
+    /// `false` if the channel closed or the event should be ignored
+    async fn handle_activated_event(
+        activated: ashpd::desktop::input_capture::Activated,
+        barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        portal_to_server_tx: &tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+    ) -> bool {
+        info!("Activated signal received!");
+
+        // Extract activation ID and cursor position
+        let activation_id = match activated.activation_id() {
+            Some(id) => id,
+            None => {
+                warn!("Activated event without activation ID");
+                return false;
+            }
+        };
+
+        let barrier_id = match activated.barrier_id() {
+            Some(ashpd::desktop::input_capture::ActivatedBarrier::Barrier(id)) => id.get(),
+            Some(ashpd::desktop::input_capture::ActivatedBarrier::UnknownBarrier) => {
+                warn!("Activated event with unknown barrier");
+                return false;
+            }
+            None => {
+                warn!("Activated event without barrier ID");
+                return false;
+            }
+        };
+
+        let cursor = match activated.cursor_position() {
+            Some((x, y)) => Point::new(x as f64, y as f64),
+            None => {
+                warn!("Activated event without cursor position");
+                Point::new(0.0, 0.0)
+            }
+        };
+
+        info!(
+            "Portal activated! Activation ID: {}, Barrier ID: {}, Position: ({:.2}, {:.2})",
+            activation_id, barrier_id, cursor.x, cursor.y
+        );
+
+        // Look up client info from barrier map
+        let barrier_lookup = barrier_map.read().await;
+        let (client_name, client_position) = match barrier_lookup.get(&barrier_id) {
+            Some((name, position)) => (name.clone(), *position),
+            None => {
+                warn!(
+                    "Unknown barrier ID: {} (no client mapping found)",
+                    barrier_id
+                );
+                return false;
+            }
+        };
+        drop(barrier_lookup);
+
+        // Send the activated event through the channel
+        let event = crate::server::Event::Activated {
+            client_name,
+            client_position,
+            activation_id,
+            cursor,
+        };
+
+        if portal_to_server_tx.send(event).is_err() {
+            warn!("Failed to send activated event (receiver dropped)");
+            return false;
+        }
+        info!("✓ Activation event forwarded to server");
+
+        true
+    }
+
+    /// Handle zones_changed event from the portal
+    ///
+    /// Processes a zone change event by re-setting up barriers with the new zones
+    /// and re-enabling the session.
+    async fn handle_zones_changed_event(
+        zones_changed: ashpd::desktop::input_capture::ZonesChanged,
+        proxy: &InputCapture,
+        session: &ashpd::desktop::Session<InputCapture>,
+        client_configs: &HashMap<String, ClientConfig>,
+        barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: &Arc<RwLock<DesktopBounds>>,
+    ) {
+        info!(
+            "Zones changed: session={:?}, zone_set={:?}",
+            zones_changed.session_handle(),
+            zones_changed.zone_set()
+        );
+
+        // Re-setup barriers with the new zones
+        match Self::setup_barriers(proxy, session, client_configs).await {
+            Ok((map, bounds)) => {
+                *barrier_map.write().await = map;
+                *desktop_bounds.write().await = bounds;
+                info!("✓ Barriers re-configured after zone change");
+
+                // Re-enable the session after reconfiguring barriers
+                if let Err(e) = proxy.enable(session, EnableOptions::default()).await {
+                    warn!(
+                        "Failed to re-enable InputCapture session after zone change: {}",
+                        e
+                    );
+                } else {
+                    info!("✓ InputCapture session re-enabled");
+                }
+            }
+            Err(e) => {
+                warn!("Failed to re-setup barriers after zone change: {}", e);
+            }
+        }
+    }
+
+    /// Handle server event (commands from the server task)
+    ///
+    /// Processes events sent from the server task, such as release capture,
+    /// enable/disable session requests.
+    ///
+    /// # Returns
+    ///
+    /// Returns (updated_is_enabled, updated_poll_eis) tuple
+    async fn handle_server_event(
+        event: crate::server::Event,
+        proxy: &InputCapture,
+        session: &ashpd::desktop::Session<InputCapture>,
+        is_enabled: bool,
+        poll_eis: bool,
+    ) -> (bool, bool) {
+        match event {
+            crate::server::Event::ReleaseCapture {
+                activation_id,
+                cursor,
+            } => {
+                info!(
+                    "Releasing InputCapture session: activation_id={:?}, cursor={:?}",
+                    activation_id, cursor
+                );
+                let cursor_tuple = cursor.map(|p| (p.x, p.y));
+                let opts = ReleaseOptions::default()
+                    .set_activation_id(activation_id)
+                    .set_cursor_position(cursor_tuple);
+                if let Err(e) = proxy.release(session, opts).await {
+                    warn!("Failed to release InputCapture session: {}", e);
+                } else {
+                    info!("✓ InputCapture session released");
+                }
+
+                // Stop polling EIS events since capture is no longer active
+                (is_enabled, false)
+            }
+            crate::server::Event::EnableCapture if !is_enabled => {
+                info!("Enabling InputCapture session...");
+                if let Err(e) = proxy.enable(session, EnableOptions::default()).await {
+                    warn!("Failed to enable InputCapture session: {}", e);
+                    (is_enabled, poll_eis)
+                } else {
+                    info!("✓ InputCapture session enabled");
+                    (true, poll_eis)
+                }
+            }
+            crate::server::Event::DisableCapture if is_enabled => {
+                info!("Disabling InputCapture session...");
+                if let Err(e) = proxy.disable(session, DisableOptions::default()).await {
+                    warn!("Failed to disable InputCapture session: {}", e);
+                    (is_enabled, poll_eis)
+                } else {
+                    info!("✓ InputCapture session disabled");
+                    (false, poll_eis)
+                }
+            }
+            crate::server::Event::EnableCapture | crate::server::Event::DisableCapture => {
+                // Ignore redundant enable/disable commands
+                debug!(
+                    "Ignoring redundant {:?} command (is_enabled={})",
+                    event, is_enabled
+                );
+                (is_enabled, poll_eis)
+            }
+            _ => {
+                warn!("Portal received unexpected event: {:?}", event);
+                (is_enabled, poll_eis)
+            }
+        }
+    }
+
+    /// Set up pointer barriers based on zones from InputCapture portal
+    ///
+    /// This queries the zones from the InputCapture portal and creates barriers
+    /// at the edges of each zone based on the configured client positions.
+    ///
+    /// # Arguments
+    ///
+    /// * `proxy` - The InputCapture proxy
+    /// * `session` - The portal session handle
+    /// * `client_configs` - Map of client names to their position configurations
+    ///
+    /// # Returns
+    ///
+    /// Returns a tuple of (barrier map, desktop bounds)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if querying zones or setting barriers fails
+    async fn setup_barriers(
+        proxy: &InputCapture,
+        session: &ashpd::desktop::Session<InputCapture>,
+        client_configs: &HashMap<String, ClientConfig>,
+    ) -> Result<(HashMap<u32, (String, Position)>, DesktopBounds)> {
+        // Query zones from the InputCapture portal
+        info!("Querying zones from InputCapture portal...");
+        let zones = proxy
+            .zones(session, GetZonesOptions::default())
+            .await
+            .context("Failed to request zones")?
+            .response()
+            .context("Failed to get zones response")?;
+
+        info!(
+            "Received {} zone(s) with zone_set ID: {}",
+            zones.regions().len(),
+            zones.zone_set()
+        );
+
+        // Calculate the bounding box of all zones (the entire desktop)
+        let mut min_x = i32::MAX;
+        let mut min_y = i32::MAX;
+        let mut max_x = i32::MIN;
+        let mut max_y = i32::MIN;
+
+        for (zone_idx, zone) in zones.regions().iter().enumerate() {
+            let x = zone.x_offset();
+            let y = zone.y_offset();
+            let width = zone.width();
+            let height = zone.height();
+
+            info!(
+                "Zone {}: offset=({}, {}), size={}x{}",
+                zone_idx, x, y, width, height
+            );
+
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + width as i32);
+            max_y = max_y.max(y + height as i32);
+        }
+
+        info!(
+            "Desktop bounding box: ({}, {}) to ({}, {}) [{}x{}]",
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            max_x - min_x,
+            max_y - min_y
+        );
+
+        let mut barriers = Vec::new();
+        let mut barrier_id = 1u32;
+        let mut barrier_map: HashMap<u32, (String, Position)> = HashMap::new();
+
+        // Create barriers only on the outer edges of the entire desktop
+        for (client_name, config) in client_configs {
+            // Only create barriers for clients positioned relative to the server (self)
+            if config.reference != "self" {
+                continue;
+            }
+
+            let barrier_id_nonzero = NonZeroU32::new(barrier_id).unwrap();
+            let barrier = match config.position {
+                Position::LeftOf => {
+                    // Client is to the left, so barrier on left edge of desktop
+                    info!(
+                        "  Adding left barrier (ID {}) for client '{}'",
+                        barrier_id, client_name
+                    );
+                    Barrier::new(barrier_id_nonzero, (min_x, min_y, min_x, max_y))
+                }
+                Position::RightOf => {
+                    // Client is to the right, so barrier on right edge of desktop
+                    info!(
+                        "  Adding right barrier (ID {}) for client '{}'",
+                        barrier_id, client_name
+                    );
+                    Barrier::new(barrier_id_nonzero, (max_x, min_y, max_x, max_y))
+                }
+                Position::TopOf => {
+                    // Client is above, so barrier on top edge of desktop
+                    info!(
+                        "  Adding top barrier (ID {}) for client '{}'",
+                        barrier_id, client_name
+                    );
+                    Barrier::new(barrier_id_nonzero, (min_x, min_y, max_x, min_y))
+                }
+                Position::BottomOf => {
+                    // Client is below, so barrier on bottom edge of desktop
+                    info!(
+                        "  Adding bottom barrier (ID {}) for client '{}'",
+                        barrier_id, client_name
+                    );
+                    Barrier::new(barrier_id_nonzero, (min_x, max_y, max_x, max_y))
+                }
+            };
+
+            barriers.push(barrier);
+            barrier_map.insert(barrier_id, (client_name.clone(), config.position));
+            barrier_id += 1;
+        }
+
+        info!(
+            "Setting {} pointer barrier(s) with zone_set {}",
+            barriers.len(),
+            zones.zone_set()
+        );
+        proxy
+            .set_pointer_barriers(
+                session,
+                &barriers,
+                zones.zone_set(),
+                SetPointerBarriersOptions::default(),
+            )
+            .await
+            .context("Failed to set pointer barriers")?
+            .response()
+            .context("Failed to get set_pointer_barriers response")?;
+
+        info!("✓ Pointer barriers configured");
+
+        let desktop_bounds = DesktopBounds {
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+        };
+
+        Ok((barrier_map, desktop_bounds))
+    }
 }

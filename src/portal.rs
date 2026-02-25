@@ -176,21 +176,18 @@ impl InputCapturePortal {
         )
         .await?;
 
-        debug!("Subscribing to zones_changed signal...");
         let zones_changed_stream = proxy
             .receive_zones_changed()
             .await
             .context("Failed to subscribe to zones_changed signal")?;
 
-        debug!("Subscribing to activated signal...");
         let activated_stream = proxy
             .receive_activated()
             .await
             .context("Failed to subscribe to activated signal")?;
-        info!("✓ Successfully subscribed to activated signal");
 
         // Run the main event loop
-        info!("Portal task starting event loop");
+        debug!("Portal task starting event loop");
         let mut is_enabled = false;
         let mut poll_eis = false;
         let mut ei_context = ei_context;
@@ -263,9 +260,6 @@ impl InputCapturePortal {
             .await
             .context("Failed to create InputCapture session")?;
 
-        debug!("InputCapture session created");
-
-        // Connect to the EI (Emulated Input) socket
         let _owned_fd = proxy
             .connect_to_eis(&session, ConnectToEISOptions::default())
             .await
@@ -277,7 +271,6 @@ impl InputCapturePortal {
             raw_fd
         );
 
-        // Set up EI context
         let ei_context = ei::connect_with_fd(raw_fd)
             .await
             .context("Failed to connect to EI in portal task")?;
@@ -639,7 +632,7 @@ impl InputCapturePortal {
             let barrier = match config.position {
                 Position::LeftOf => {
                     // Client is to the left, so barrier on left edge of desktop
-                    info!(
+                    debug!(
                         "  Adding left barrier (ID {}) for client '{}'",
                         barrier_id, &config.name
                     );
@@ -647,7 +640,7 @@ impl InputCapturePortal {
                 }
                 Position::RightOf => {
                     // Client is to the right, so barrier on right edge of desktop
-                    info!(
+                    debug!(
                         "  Adding right barrier (ID {}) for client '{}'",
                         barrier_id, &config.name
                     );
@@ -655,7 +648,7 @@ impl InputCapturePortal {
                 }
                 Position::TopOf => {
                     // Client is above, so barrier on top edge of desktop
-                    info!(
+                    debug!(
                         "  Adding top barrier (ID {}) for client '{}'",
                         barrier_id, &config.name
                     );
@@ -663,7 +656,7 @@ impl InputCapturePortal {
                 }
                 Position::BottomOf => {
                     // Client is below, so barrier on bottom edge of desktop
-                    info!(
+                    debug!(
                         "  Adding bottom barrier (ID {}) for client '{}'",
                         barrier_id, &config.name
                     );
@@ -676,7 +669,7 @@ impl InputCapturePortal {
             barrier_id += 1;
         }
 
-        info!(
+        debug!(
             "Setting {} pointer barrier(s) with zone_set {}",
             barriers.len(),
             zones.zone_set()

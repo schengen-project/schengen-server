@@ -199,6 +199,11 @@ impl InputCapturePortal {
             .await
             .context("Failed to subscribe to activated signal")?;
 
+        let deactivated_stream = proxy
+            .receive_deactivated()
+            .await
+            .context("Failed to subscribe to deactivated signal")?;
+
         // Run the main event loop
         debug!("Portal task starting event loop");
         let mut is_enabled = false;
@@ -206,6 +211,7 @@ impl InputCapturePortal {
         let mut ei_context = ei_context;
         let mut zones_changed_stream = zones_changed_stream;
         let mut activated_stream = activated_stream;
+        let mut deactivated_stream = deactivated_stream;
 
         loop {
             use futures_util::StreamExt;
@@ -224,6 +230,15 @@ impl InputCapturePortal {
                         // Start polling EIS events now that capture is active
                         poll_eis = true;
                     }
+                }
+
+                // Handle deactivated events from the portal
+                Some(deactivated) = deactivated_stream.next() => {
+                    Self::handle_deactivated_event(deactivated);
+                    // Stop polling EIS events since capture is no longer active
+                    // FIXME: potential for a race condition here because we might receive that
+                    // signal before all EI events have been processed. Fix when needed
+                    poll_eis = false;
                 }
 
                 // Handle zones_changed events from the portal
@@ -393,6 +408,28 @@ impl InputCapturePortal {
         info!("✓ Activation event forwarded to server");
 
         true
+    }
+
+    /// Handle deactivated event from the portal
+    ///
+    /// Processes a barrier deactivation event, which indicates that the cursor
+    /// has moved back from the client to the server.
+    fn handle_deactivated_event(deactivated: ashpd::desktop::input_capture::Deactivated) {
+        info!("Deactivated signal received!");
+
+        let activation_id = match deactivated.activation_id() {
+            Some(id) => id,
+            None => {
+                warn!("Deactivated event without activation ID");
+                return;
+            }
+        };
+
+        info!(
+            "Portal deactivated! Activation ID: {}, Session: {:?}",
+            activation_id,
+            deactivated.session_handle()
+        );
     }
 
     /// Handle zones_changed event from the portal

@@ -175,7 +175,7 @@ impl InputCapturePortal {
         let raw_fd = _owned_fd.as_raw_fd();
         info!("InputCapture portal connected successfully");
 
-        let ei_context = ei::connect_with_fd(raw_fd)
+        let mut ei_context = ei::connect_with_fd(raw_fd)
             .await
             .context("Failed to connect to EI in portal task")?;
 
@@ -189,22 +189,22 @@ impl InputCapturePortal {
         *barrier_map.write().await = map;
         *desktop_bounds.write().await = bounds;
 
-        let zones_changed_stream = proxy
+        let mut zones_changed_stream = proxy
             .receive_zones_changed()
             .await
             .context("Failed to subscribe to zones_changed signal")?;
 
-        let activated_stream = proxy
+        let mut activated_stream = proxy
             .receive_activated()
             .await
             .context("Failed to subscribe to activated signal")?;
 
-        let deactivated_stream = proxy
+        let mut deactivated_stream = proxy
             .receive_deactivated()
             .await
             .context("Failed to subscribe to deactivated signal")?;
 
-        let disabled_stream = proxy
+        let mut disabled_stream = proxy
             .receive_disabled()
             .await
             .context("Failed to subscribe to disabled signal")?;
@@ -213,11 +213,6 @@ impl InputCapturePortal {
         debug!("Portal task starting event loop");
         let mut is_enabled = false;
         let mut poll_eis = false;
-        let mut ei_context = ei_context;
-        let mut zones_changed_stream = zones_changed_stream;
-        let mut activated_stream = activated_stream;
-        let mut deactivated_stream = deactivated_stream;
-        let mut disabled_stream = disabled_stream;
 
         loop {
             use futures_util::StreamExt;

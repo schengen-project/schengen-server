@@ -158,23 +158,36 @@ impl InputCapturePortal {
         portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
         server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
     ) -> Result<()> {
-        // Get capabilities - we want both keyboard and pointer
         let capabilities = ashpd::desktop::input_capture::Capabilities::Keyboard
             | ashpd::desktop::input_capture::Capabilities::Pointer;
 
-        // Create session and connect to EI
-        let (session, ei_context) =
-            Self::create_session_and_connect_ei(&proxy, capabilities).await?;
+        let opts = CreateSessionOptions::default().set_capabilities(capabilities);
+        let (session, _caps) = proxy
+            .create_session(None, opts)
+            .await
+            .context("Failed to create InputCapture session")?;
 
-        // Set up barriers
-        Self::setup_initial_barriers(
-            &proxy,
-            &session,
-            &client_configs,
-            &barrier_map,
-            &desktop_bounds,
-        )
-        .await?;
+        let _owned_fd = proxy
+            .connect_to_eis(&session, ConnectToEISOptions::default())
+            .await
+            .context("Failed to connect to EIS")?;
+
+        let raw_fd = _owned_fd.as_raw_fd();
+        info!("InputCapture portal connected successfully");
+
+        let ei_context = ei::connect_with_fd(raw_fd)
+            .await
+            .context("Failed to connect to EI in portal task")?;
+
+        // Keep the fd alive by storing it in the EI context (it will be dropped when the task ends)
+        std::mem::forget(_owned_fd);
+
+        let (map, bounds) = Self::setup_barriers(&proxy, &session, &client_configs)
+            .await
+            .context("Failed to setup initial barriers")?;
+
+        *barrier_map.write().await = map;
+        *desktop_bounds.write().await = bounds;
 
         let zones_changed_stream = proxy
             .receive_zones_changed()
@@ -246,57 +259,6 @@ impl InputCapturePortal {
         }
 
         warn!("Portal monitor task exiting!");
-        Ok(())
-    }
-
-    /// Create portal session and connect to EI
-    async fn create_session_and_connect_ei(
-        proxy: &InputCapture,
-        capabilities: ashpd::enumflags2::BitFlags<ashpd::desktop::input_capture::Capabilities>,
-    ) -> Result<(ashpd::desktop::Session<InputCapture>, ei::EiContext)> {
-        let opts = CreateSessionOptions::default().set_capabilities(capabilities);
-        let (session, _caps) = proxy
-            .create_session(None, opts)
-            .await
-            .context("Failed to create InputCapture session")?;
-
-        let _owned_fd = proxy
-            .connect_to_eis(&session, ConnectToEISOptions::default())
-            .await
-            .context("Failed to connect to EIS")?;
-
-        let raw_fd = _owned_fd.as_raw_fd();
-        info!(
-            "InputCapture portal connected successfully (fd: {})",
-            raw_fd
-        );
-
-        let ei_context = ei::connect_with_fd(raw_fd)
-            .await
-            .context("Failed to connect to EI in portal task")?;
-
-        // Keep the fd alive by storing it in the EI context (it will be dropped when the task ends)
-        std::mem::forget(_owned_fd);
-
-        Ok((session, ei_context))
-    }
-
-    /// Set up initial barriers
-    async fn setup_initial_barriers(
-        proxy: &InputCapture,
-        session: &ashpd::desktop::Session<InputCapture>,
-        client_configs: &[ClientConfig],
-        barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
-        desktop_bounds: &Arc<RwLock<DesktopBounds>>,
-    ) -> Result<()> {
-        info!("Setting up pointer barriers...");
-        let (map, bounds) = Self::setup_barriers(proxy, session, client_configs)
-            .await
-            .context("Failed to setup initial barriers")?;
-
-        *barrier_map.write().await = map;
-        *desktop_bounds.write().await = bounds;
-
         Ok(())
     }
 

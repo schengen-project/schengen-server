@@ -215,12 +215,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Create server instance
+    // Step 1: Connect to InputCapture portal and libei
+    info!("Step 1/2: Connecting to InputCapture portal and libei...");
+    let input_capture = portal::InputCapturePortal::new(&client_config).await?;
+
+    // Step 2: Create server instance and attach portal
     let mut server = server::Server::new(client_config);
     server.set_port(args.port);
-
-    // Connect to portal and libei
-    let server = server.connect_portal().await?;
+    let server = server.with_portal(input_capture);
 
     // Run the server
     server.run().await?;

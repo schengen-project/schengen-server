@@ -81,12 +81,6 @@ struct ActiveClient {
 /// Typestate marker for a server that has not yet connected to the portal
 pub struct NotConnected;
 
-/// Typestate representing a server that has successfully connected to the portal
-pub struct PortalConnected {
-    portal_session: portal::Session,
-    desktop_bounds: Arc<RwLock<portal::DesktopBounds>>,
-}
-
 /// Server for managing Synergy protocol connections with InputCapture portal integration
 pub struct Server<State> {
     port: u16,
@@ -119,28 +113,24 @@ impl Server<NotConnected> {
         self.port = port;
     }
 
-    /// Connect to the InputCapture portal and set up libei with barriers
+    /// Attach a connected portal to the server
     ///
-    /// # Errors
+    /// # Arguments
     ///
-    /// Returns an error if portal connection or barrier setup fails
-    pub async fn connect_portal(self) -> Result<Server<PortalConnected>> {
-        info!("Connecting to InputCapture portal and libei...");
-        let (portal_session, _barrier_map, desktop_bounds) =
-            portal::connect_input_capture(&self.client_configs).await?;
-
-        Ok(Server {
+    /// * `portal` - The connected portal instance
+    pub fn with_portal(
+        self,
+        portal: portal::InputCapturePortal,
+    ) -> Server<portal::InputCapturePortal> {
+        Server {
             port: self.port,
             client_configs: self.client_configs,
-            state: PortalConnected {
-                portal_session,
-                desktop_bounds,
-            },
-        })
+            state: portal,
+        }
     }
 }
 
-impl Server<PortalConnected> {
+impl Server<portal::InputCapturePortal> {
     /// Run the TCP server using schengen::server API
     ///
     /// This function builds a schengen server with the configured clients and manages

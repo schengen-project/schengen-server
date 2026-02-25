@@ -204,6 +204,11 @@ impl InputCapturePortal {
             .await
             .context("Failed to subscribe to deactivated signal")?;
 
+        let disabled_stream = proxy
+            .receive_disabled()
+            .await
+            .context("Failed to subscribe to disabled signal")?;
+
         // Run the main event loop
         debug!("Portal task starting event loop");
         let mut is_enabled = false;
@@ -212,6 +217,7 @@ impl InputCapturePortal {
         let mut zones_changed_stream = zones_changed_stream;
         let mut activated_stream = activated_stream;
         let mut deactivated_stream = deactivated_stream;
+        let mut disabled_stream = disabled_stream;
 
         loop {
             use futures_util::StreamExt;
@@ -239,6 +245,15 @@ impl InputCapturePortal {
                     // FIXME: potential for a race condition here because we might receive that
                     // signal before all EI events have been processed. Fix when needed
                     poll_eis = false;
+                }
+
+                // Handle disabled events from the portal
+                Some(_) = disabled_stream.next() => {
+                    // TODO: if we get disabled we need to re-initialize the whole
+                    // session
+                    is_enabled = false;
+                    poll_eis = false;
+                    warn!("InputCapture portal session was disabled. This is not yet implemented");
                 }
 
                 // Handle zones_changed events from the portal

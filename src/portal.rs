@@ -75,7 +75,7 @@ impl InputCapturePortal {
     ///
     /// # Arguments
     ///
-    /// * `client_configs` - Map of client names to their position configurations
+    /// * `client_configs` - Slice of client configurations
     ///
     /// # Returns
     ///
@@ -84,7 +84,7 @@ impl InputCapturePortal {
     /// # Errors
     ///
     /// Returns an error if the portal connection fails or permissions are denied
-    pub async fn new(client_configs: &HashMap<String, ClientConfig>) -> Result<Self> {
+    pub async fn new(client_configs: &[ClientConfig]) -> Result<Self> {
         info!("Connecting to InputCapture portal");
 
         let proxy = InputCapture::new()
@@ -107,7 +107,7 @@ impl InputCapturePortal {
             proxy,
             Arc::clone(&barrier_map),
             Arc::clone(&desktop_bounds),
-            client_configs.clone(),
+            client_configs.to_vec(),
             portal_to_server_tx,
             server_to_portal_rx,
         );
@@ -128,7 +128,7 @@ impl InputCapturePortal {
         proxy: InputCapture,
         barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
         desktop_bounds: Arc<RwLock<DesktopBounds>>,
-        client_configs: HashMap<String, ClientConfig>,
+        client_configs: Vec<ClientConfig>,
         portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
         mut server_to_portal_rx: tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
     ) {
@@ -154,7 +154,7 @@ impl InputCapturePortal {
         proxy: InputCapture,
         barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
         desktop_bounds: Arc<RwLock<DesktopBounds>>,
-        client_configs: HashMap<String, ClientConfig>,
+        client_configs: Vec<ClientConfig>,
         portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
         server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
     ) -> Result<()> {
@@ -303,7 +303,7 @@ impl InputCapturePortal {
     async fn setup_initial_barriers(
         proxy: &InputCapture,
         session: &ashpd::desktop::Session<InputCapture>,
-        client_configs: &HashMap<String, ClientConfig>,
+        client_configs: &[ClientConfig],
         barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
         desktop_bounds: &Arc<RwLock<DesktopBounds>>,
     ) -> Result<()> {
@@ -484,7 +484,7 @@ impl InputCapturePortal {
         zones_changed: ashpd::desktop::input_capture::ZonesChanged,
         proxy: &InputCapture,
         session: &ashpd::desktop::Session<InputCapture>,
-        client_configs: &HashMap<String, ClientConfig>,
+        client_configs: &[ClientConfig],
         barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
         desktop_bounds: &Arc<RwLock<DesktopBounds>>,
     ) {
@@ -598,7 +598,7 @@ impl InputCapturePortal {
     ///
     /// * `proxy` - The InputCapture proxy
     /// * `session` - The portal session handle
-    /// * `client_configs` - Map of client names to their position configurations
+    /// * `client_configs` - Slice of client configurations
     ///
     /// # Returns
     ///
@@ -610,7 +610,7 @@ impl InputCapturePortal {
     async fn setup_barriers(
         proxy: &InputCapture,
         session: &ashpd::desktop::Session<InputCapture>,
-        client_configs: &HashMap<String, ClientConfig>,
+        client_configs: &[ClientConfig],
     ) -> Result<(HashMap<u32, (String, Position)>, DesktopBounds)> {
         // Query zones from the InputCapture portal
         info!("Querying zones from InputCapture portal...");
@@ -665,7 +665,7 @@ impl InputCapturePortal {
         let mut barrier_map: HashMap<u32, (String, Position)> = HashMap::new();
 
         // Create barriers only on the outer edges of the entire desktop
-        for (client_name, config) in client_configs {
+        for config in client_configs {
             // Only create barriers for clients positioned relative to the server (self)
             if config.reference != "self" {
                 continue;
@@ -677,7 +677,7 @@ impl InputCapturePortal {
                     // Client is to the left, so barrier on left edge of desktop
                     info!(
                         "  Adding left barrier (ID {}) for client '{}'",
-                        barrier_id, client_name
+                        barrier_id, &config.name
                     );
                     Barrier::new(barrier_id_nonzero, (min_x, min_y, min_x, max_y))
                 }
@@ -685,7 +685,7 @@ impl InputCapturePortal {
                     // Client is to the right, so barrier on right edge of desktop
                     info!(
                         "  Adding right barrier (ID {}) for client '{}'",
-                        barrier_id, client_name
+                        barrier_id, &config.name
                     );
                     Barrier::new(barrier_id_nonzero, (max_x, min_y, max_x, max_y))
                 }
@@ -693,7 +693,7 @@ impl InputCapturePortal {
                     // Client is above, so barrier on top edge of desktop
                     info!(
                         "  Adding top barrier (ID {}) for client '{}'",
-                        barrier_id, client_name
+                        barrier_id, &config.name
                     );
                     Barrier::new(barrier_id_nonzero, (min_x, min_y, max_x, min_y))
                 }
@@ -701,14 +701,14 @@ impl InputCapturePortal {
                     // Client is below, so barrier on bottom edge of desktop
                     info!(
                         "  Adding bottom barrier (ID {}) for client '{}'",
-                        barrier_id, client_name
+                        barrier_id, &config.name
                     );
                     Barrier::new(barrier_id_nonzero, (min_x, max_y, max_x, max_y))
                 }
             };
 
             barriers.push(barrier);
-            barrier_map.insert(barrier_id, (client_name.clone(), config.position));
+            barrier_map.insert(barrier_id, (config.name.clone(), config.position));
             barrier_id += 1;
         }
 

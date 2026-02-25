@@ -55,6 +55,36 @@ pub struct DesktopBounds {
     pub max_y: i32,
 }
 
+/// A connected InputCapture portal with session and desktop bounds
+pub struct InputCapturePortal {
+    pub portal_session: Session,
+    pub desktop_bounds: Arc<RwLock<DesktopBounds>>,
+}
+
+impl InputCapturePortal {
+    /// Create a new InputCapturePortal by connecting to the portal and setting up EIS
+    ///
+    /// This function uses ashpd to establish a connection to the InputCapture portal,
+    /// requesting permission to capture mouse and keyboard events. It creates a session,
+    /// obtains a file descriptor for the EI connection, sets up the EI context,
+    /// and configures pointer barriers based on client configurations.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_configs` - Map of client names to their position configurations
+    ///
+    /// # Returns
+    ///
+    /// Returns an InputCapturePortal instance
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the portal connection fails or permissions are denied
+    pub async fn new(client_configs: &HashMap<String, ClientConfig>) -> Result<Self> {
+        connect_input_capture_impl(client_configs).await
+    }
+}
+
 /// Portal session wrapper holding the InputCapture session
 pub struct Session {
     _owned_fd: OwnedFd,
@@ -231,31 +261,12 @@ async fn setup_barriers(
     Ok((barrier_map, desktop_bounds))
 }
 
-/// Connect to the InputCapture portal with mouse and keyboard permissions
+/// Implementation function for connecting to the InputCapture portal
 ///
-/// This function uses ashpd to establish a connection to the InputCapture portal,
-/// requesting permission to capture mouse and keyboard events. It creates a session,
-/// obtains a file descriptor for the EI connection, sets up the EI context,
-/// and configures pointer barriers based on client configurations.
-///
-/// # Arguments
-///
-/// * `client_configs` - Map of client names to their position configurations
-///
-/// # Returns
-///
-/// Returns a tuple of (portal Session, barrier map, desktop bounds)
-///
-/// # Errors
-///
-/// Returns an error if the portal connection fails or permissions are denied
-pub async fn connect_input_capture(
+/// This is called by InputCapturePortal::new()
+async fn connect_input_capture_impl(
     client_configs: &HashMap<String, ClientConfig>,
-) -> Result<(
-    Session,
-    Arc<RwLock<HashMap<u32, (String, Position)>>>,
-    Arc<RwLock<DesktopBounds>>,
-)> {
+) -> Result<InputCapturePortal> {
     info!("Connecting to InputCapture portal");
 
     let proxy = InputCapture::new()
@@ -621,5 +632,8 @@ pub async fn connect_input_capture(
         event_tx: server_to_portal_tx,
     };
 
-    Ok((portal_session, barrier_map, desktop_bounds))
+    Ok(InputCapturePortal {
+        portal_session,
+        desktop_bounds,
+    })
 }

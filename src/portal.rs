@@ -176,10 +176,6 @@ impl InputCapturePortal {
         )
         .await?;
 
-        // Wait for initial enable signal
-        Self::wait_for_initial_enable(server_to_portal_rx).await?;
-
-        // Subscribe to portal signals
         debug!("Subscribing to zones_changed signal...");
         let zones_changed_stream = proxy
             .receive_zones_changed()
@@ -193,16 +189,9 @@ impl InputCapturePortal {
             .context("Failed to subscribe to activated signal")?;
         info!("✓ Successfully subscribed to activated signal");
 
-        // Enable the session
-        proxy
-            .enable(&session, EnableOptions::default())
-            .await
-            .context("Failed to enable InputCapture session")?;
-        info!("✓ InputCapture session enabled");
-
         // Run the main event loop
         info!("Portal task starting event loop");
-        let mut is_enabled = true;
+        let mut is_enabled = false;
         let mut poll_eis = false;
         let mut ei_context = ei_context;
         let mut zones_changed_stream = zones_changed_stream;
@@ -316,31 +305,6 @@ impl InputCapturePortal {
         *desktop_bounds.write().await = bounds;
 
         Ok(())
-    }
-
-    /// Wait for the initial enable signal from the server
-    async fn wait_for_initial_enable(
-        server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
-    ) -> Result<()> {
-        info!("Waiting for first client connection before enabling InputCapture...");
-
-        loop {
-            match server_to_portal_rx.recv().await {
-                Some(crate::server::Event::EnableCapture) => {
-                    info!("Received enable command");
-                    return Ok(());
-                }
-                Some(crate::server::Event::DisableCapture) => {
-                    warn!("Received disable before initial enable, ignoring");
-                }
-                Some(_) => {
-                    // Ignore other events
-                }
-                None => {
-                    anyhow::bail!("Event channel closed before enable");
-                }
-            }
-        }
     }
 
     /// Handle EIS input events and forward them to the server

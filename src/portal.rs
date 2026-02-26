@@ -630,13 +630,8 @@ impl InputCapturePortal {
         let mut barrier_id = 1u32;
         let mut barrier_map: HashMap<u32, (String, Position)> = HashMap::new();
 
-        // Create barriers only on the outer edges of the entire desktop
-        for config in client_configs {
-            // Only create barriers for clients positioned relative to the server (self)
-            if config.reference != "self" {
-                continue;
-            }
-
+        // Create barriers only on the outer edges of *our* desktop area
+        for config in client_configs.iter().filter(|c| c.reference == "self") {
             let barrier_id_nonzero = NonZeroU32::new(barrier_id).unwrap();
             let barrier = match config.position {
                 Position::LeftOf => {

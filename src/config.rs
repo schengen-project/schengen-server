@@ -63,6 +63,18 @@ impl Position {
     }
 }
 
+impl std::fmt::Display for Position {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter) -> Result<(), std::fmt::Error> {
+        let s = match self {
+            Position::LeftOf => "left-of",
+            Position::RightOf => "right-of",
+            Position::TopOf => "top-of",
+            Position::BottomOf => "bottom-of",
+        };
+        write!(formatter, "{}", s)
+    }
+}
+
 /// Configuration for a client
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {

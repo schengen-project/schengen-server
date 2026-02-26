@@ -634,39 +634,18 @@ impl InputCapturePortal {
         for config in client_configs.iter().filter(|c| c.reference == "self") {
             let barrier_id_nonzero = NonZeroU32::new(barrier_id).unwrap();
             let barrier = match config.position {
-                Position::LeftOf => {
-                    // Client is to the left, so barrier on left edge of desktop
-                    debug!(
-                        "  Adding left barrier (ID {}) for client '{}'",
-                        barrier_id, &config.name
-                    );
-                    Barrier::new(barrier_id_nonzero, (min_x, min_y, min_x, max_y))
-                }
-                Position::RightOf => {
-                    // Client is to the right, so barrier on right edge of desktop
-                    debug!(
-                        "  Adding right barrier (ID {}) for client '{}'",
-                        barrier_id, &config.name
-                    );
-                    Barrier::new(barrier_id_nonzero, (max_x, min_y, max_x, max_y))
-                }
-                Position::TopOf => {
-                    // Client is above, so barrier on top edge of desktop
-                    debug!(
-                        "  Adding top barrier (ID {}) for client '{}'",
-                        barrier_id, &config.name
-                    );
-                    Barrier::new(barrier_id_nonzero, (min_x, min_y, max_x, min_y))
-                }
+                Position::LeftOf => Barrier::new(barrier_id_nonzero, (min_x, min_y, min_x, max_y)),
+                Position::RightOf => Barrier::new(barrier_id_nonzero, (max_x, min_y, max_x, max_y)),
+                Position::TopOf => Barrier::new(barrier_id_nonzero, (min_x, min_y, max_x, min_y)),
                 Position::BottomOf => {
-                    // Client is below, so barrier on bottom edge of desktop
-                    debug!(
-                        "  Adding bottom barrier (ID {}) for client '{}'",
-                        barrier_id, &config.name
-                    );
                     Barrier::new(barrier_id_nonzero, (min_x, max_y, max_x, max_y))
                 }
             };
+
+            debug!(
+                "Adding barrier (ID {}) {} self for client '{}'",
+                barrier_id, config.position, &config.name
+            );
 
             barriers.push(barrier);
             barrier_map.insert(barrier_id, (config.name.clone(), config.position));

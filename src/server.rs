@@ -375,6 +375,12 @@ async fn handle_barrier_events(
                         let desktop_height = (bounds.max_y - bounds.min_y) as f64;
                         drop(bounds);
 
+                        // Guard against division by zero
+                        if desktop_width <= 0.0 || desktop_height <= 0.0 {
+                            warn!("Invalid desktop dimensions ({}x{}), ignoring barrier activation", desktop_width, desktop_height);
+                            continue;
+                        }
+
                         let (enter_x, enter_y) = match client_position {
                             crate::config::Position::RightOf => {
                                 // Client is to the right: enter at left edge (x=0)

@@ -15,6 +15,44 @@ use crate::portal;
 
 const DEFAULT_PORT: u16 = 24801;
 
+/// Clamp cursor position to client bounds based on entry position
+fn clamp_cursor_to_client(
+    mut cursor: portal::Point,
+    position: crate::config::Position,
+    coord_offset: portal::Point,
+    client_size: portal::Size,
+) -> portal::Point {
+    let client_min_x = coord_offset.x;
+    let client_max_x = coord_offset.x + client_size.width - 1.0;
+    let client_min_y = coord_offset.y;
+    let client_max_y = coord_offset.y + client_size.height - 1.0;
+
+    match position {
+        crate::config::Position::RightOf => {
+            // Entered from left - allow exit left, clamp right/top/bottom
+            cursor.x = cursor.x.min(client_max_x);
+            cursor.y = cursor.y.clamp(client_min_y, client_max_y);
+        }
+        crate::config::Position::LeftOf => {
+            // Entered from right - allow exit right, clamp left/top/bottom
+            cursor.x = cursor.x.max(client_min_x);
+            cursor.y = cursor.y.clamp(client_min_y, client_max_y);
+        }
+        crate::config::Position::TopOf => {
+            // Entered from bottom - allow exit bottom, clamp left/right/top
+            cursor.x = cursor.x.clamp(client_min_x, client_max_x);
+            cursor.y = cursor.y.max(client_min_y);
+        }
+        crate::config::Position::BottomOf => {
+            // Entered from top - allow exit top, clamp left/right/bottom
+            cursor.x = cursor.x.clamp(client_min_x, client_max_x);
+            cursor.y = cursor.y.min(client_max_y);
+        }
+    }
+
+    cursor
+}
+
 /// Events that flow between the portal and server
 #[derive(Debug, Clone)]
 pub enum Event {
@@ -483,33 +521,7 @@ async fn handle_barrier_events(
                         };
 
                         // Clamp cursor to client bounds based on client position
-                        let client_min_x = client.coord_offset.x;
-                        let client_max_x = client.coord_offset.x + client.size.width - 1.0;
-                        let client_min_y = client.coord_offset.y;
-                        let client_max_y = client.coord_offset.y + client.size.height - 1.0;
-
-                        match client.position {
-                            crate::config::Position::RightOf => {
-                                // Entered from left - allow exit left, clamp right/top/bottom
-                                cursor.x = cursor.x.min(client_max_x);
-                                cursor.y = cursor.y.clamp(client_min_y, client_max_y);
-                            }
-                            crate::config::Position::LeftOf => {
-                                // Entered from right - allow exit right, clamp left/top/bottom
-                                cursor.x = cursor.x.max(client_min_x);
-                                cursor.y = cursor.y.clamp(client_min_y, client_max_y);
-                            }
-                            crate::config::Position::TopOf => {
-                                // Entered from bottom - allow exit bottom, clamp left/right/top
-                                cursor.x = cursor.x.clamp(client_min_x, client_max_x);
-                                cursor.y = cursor.y.max(client_min_y);
-                            }
-                            crate::config::Position::BottomOf => {
-                                // Entered from top - allow exit top, clamp left/right/bottom
-                                cursor.x = cursor.x.clamp(client_min_x, client_max_x);
-                                cursor.y = cursor.y.min(client_max_y);
-                            }
-                        }
+                        cursor = clamp_cursor_to_client(cursor, client.position, client.coord_offset, client.size);
 
                         // Check if pointer is within desktop bounds
                         let bounds = desktop_bounds.read().await;
@@ -574,33 +586,7 @@ async fn handle_barrier_events(
                         };
 
                         // Clamp cursor to client bounds based on client position
-                        let client_min_x = client.coord_offset.x;
-                        let client_max_x = client.coord_offset.x + client.size.width - 1.0;
-                        let client_min_y = client.coord_offset.y;
-                        let client_max_y = client.coord_offset.y + client.size.height - 1.0;
-
-                        match client.position {
-                            crate::config::Position::RightOf => {
-                                // Entered from left - allow exit left, clamp right/top/bottom
-                                cursor.x = cursor.x.min(client_max_x);
-                                cursor.y = cursor.y.clamp(client_min_y, client_max_y);
-                            }
-                            crate::config::Position::LeftOf => {
-                                // Entered from right - allow exit right, clamp left/top/bottom
-                                cursor.x = cursor.x.max(client_min_x);
-                                cursor.y = cursor.y.clamp(client_min_y, client_max_y);
-                            }
-                            crate::config::Position::TopOf => {
-                                // Entered from bottom - allow exit bottom, clamp left/right/top
-                                cursor.x = cursor.x.clamp(client_min_x, client_max_x);
-                                cursor.y = cursor.y.max(client_min_y);
-                            }
-                            crate::config::Position::BottomOf => {
-                                // Entered from top - allow exit top, clamp left/right/bottom
-                                cursor.x = cursor.x.clamp(client_min_x, client_max_x);
-                                cursor.y = cursor.y.min(client_max_y);
-                            }
-                        }
+                        cursor = clamp_cursor_to_client(cursor, client.position, client.coord_offset, client.size);
 
                         // Check if pointer is within desktop bounds
                         let bounds = desktop_bounds.read().await;

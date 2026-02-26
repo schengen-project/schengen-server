@@ -149,15 +149,25 @@ impl InputCapturePortal {
         });
     }
 
-    /// Main portal monitoring loop
-    async fn run_portal_monitor(
-        proxy: InputCapture,
-        barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
-        desktop_bounds: Arc<RwLock<DesktopBounds>>,
-        client_configs: Vec<ClientConfig>,
-        portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
-        server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
-    ) -> Result<()> {
+    /// Initialize or re-initialize the portal session
+    ///
+    /// Creates a new session, connects to EIS, sets up barriers, and subscribes to signals.
+    /// Returns everything needed for the event loop.
+    async fn initialize_session(
+        proxy: &InputCapture,
+        client_configs: &[ClientConfig],
+        barrier_map: &Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: &Arc<RwLock<DesktopBounds>>,
+    ) -> Result<(
+        ashpd::desktop::Session<InputCapture>,
+        ei::EiContext,
+        impl futures_util::Stream<Item = ashpd::desktop::input_capture::ZonesChanged>,
+        impl futures_util::Stream<Item = ashpd::desktop::input_capture::Activated>,
+        impl futures_util::Stream<Item = ashpd::desktop::input_capture::Deactivated>,
+        impl futures_util::Stream<Item = ashpd::desktop::input_capture::Disabled>,
+    )> {
+        info!("Initializing InputCapture portal session");
+
         let capabilities = ashpd::desktop::input_capture::Capabilities::Keyboard
             | ashpd::desktop::input_capture::Capabilities::Pointer;
 
@@ -173,46 +183,82 @@ impl InputCapturePortal {
             .context("Failed to connect to EIS")?;
 
         let raw_fd = _owned_fd.as_raw_fd();
-        info!("InputCapture portal connected successfully");
+        info!(
+            "InputCapture portal connected successfully (fd: {})",
+            raw_fd
+        );
 
-        let mut ei_context = ei::connect_with_fd(raw_fd)
+        let ei_context = ei::connect_with_fd(raw_fd)
             .await
-            .context("Failed to connect to EI in portal task")?;
+            .context("Failed to connect to EI")?;
 
-        // Keep the fd alive by storing it in the EI context (it will be dropped when the task ends)
+        // Keep the fd alive (it will be dropped when the EI context is dropped)
         std::mem::forget(_owned_fd);
 
-        let (map, bounds) = Self::setup_barriers(&proxy, &session, &client_configs)
+        let (map, bounds) = Self::setup_barriers(proxy, &session, client_configs)
             .await
-            .context("Failed to setup initial barriers")?;
+            .context("Failed to setup barriers")?;
 
         *barrier_map.write().await = map;
         *desktop_bounds.write().await = bounds;
 
-        let mut zones_changed_stream = proxy
+        let zones_changed_stream = proxy
             .receive_zones_changed()
             .await
             .context("Failed to subscribe to zones_changed signal")?;
 
-        let mut activated_stream = proxy
+        let activated_stream = proxy
             .receive_activated()
             .await
             .context("Failed to subscribe to activated signal")?;
 
-        let mut deactivated_stream = proxy
+        let deactivated_stream = proxy
             .receive_deactivated()
             .await
             .context("Failed to subscribe to deactivated signal")?;
 
-        let mut disabled_stream = proxy
+        let disabled_stream = proxy
             .receive_disabled()
             .await
             .context("Failed to subscribe to disabled signal")?;
 
-        // Run the main event loop
-        debug!("Portal task starting event loop");
+        info!("✓ InputCapture portal session initialized");
+
+        Ok((
+            session,
+            ei_context,
+            zones_changed_stream,
+            activated_stream,
+            deactivated_stream,
+            disabled_stream,
+        ))
+    }
+
+    /// Main portal monitoring loop
+    async fn run_portal_monitor(
+        proxy: InputCapture,
+        barrier_map: Arc<RwLock<HashMap<u32, (String, Position)>>>,
+        desktop_bounds: Arc<RwLock<DesktopBounds>>,
+        client_configs: Vec<ClientConfig>,
+        portal_to_server_tx: tokio::sync::mpsc::UnboundedSender<crate::server::Event>,
+        server_to_portal_rx: &mut tokio::sync::mpsc::UnboundedReceiver<crate::server::Event>,
+    ) -> Result<()> {
         let mut is_enabled = false;
         let mut poll_eis = false;
+
+        // Initialize the session for the first time
+        let (
+            mut session,
+            mut ei_context,
+            mut zones_changed_stream,
+            mut activated_stream,
+            mut deactivated_stream,
+            mut disabled_stream,
+        ) = Self::initialize_session(&proxy, &client_configs, &barrier_map, &desktop_bounds)
+            .await?;
+
+        // Run the main event loop
+        debug!("Portal task starting event loop");
 
         loop {
             use futures_util::StreamExt;
@@ -243,12 +289,40 @@ impl InputCapturePortal {
                 }
 
                 // Handle disabled events from the portal
-                Some(_) = disabled_stream.next() => {
-                    // TODO: if we get disabled we need to re-initialize the whole
-                    // session
+                Some(disabled) = disabled_stream.next() => {
+                    warn!(
+                        "InputCapture portal session was disabled (session: {:?}). Re-initializing...",
+                        disabled.session_handle()
+                    );
+
                     is_enabled = false;
                     poll_eis = false;
-                    warn!("InputCapture portal session was disabled. This is not yet implemented");
+
+                    // Drop the current session and all streams
+                    drop(session);
+                    drop(ei_context);
+                    drop(zones_changed_stream);
+                    drop(activated_stream);
+                    drop(deactivated_stream);
+                    drop(disabled_stream);
+
+                    // Re-initialize the session
+                    match Self::initialize_session(&proxy, &client_configs, &barrier_map, &desktop_bounds).await {
+                        Ok((new_session, new_ei_context, new_zones_changed_stream, new_activated_stream, new_deactivated_stream, new_disabled_stream)) => {
+                            session = new_session;
+                            ei_context = new_ei_context;
+                            zones_changed_stream = new_zones_changed_stream;
+                            activated_stream = new_activated_stream;
+                            deactivated_stream = new_deactivated_stream;
+                            disabled_stream = new_disabled_stream;
+                            info!("✓ InputCapture portal session re-initialized successfully");
+                        }
+                        Err(e) => {
+                            warn!("Failed to re-initialize InputCapture session: {}", e);
+                            warn!("Portal monitor task will exit");
+                            break;
+                        }
+                    }
                 }
 
                 // Handle zones_changed events from the portal
